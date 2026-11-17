@@ -59,28 +59,42 @@ seven-tap gesture opens the wizard again.
 
 ## Persistence
 
-`/var/mobile/Library/Preferences/org.usageguard.timer.plist`, written
+`/var/mobile/Library/Preferences/org.usageguard.timelock.plist`, written
 atomically. It contains the cycle state as a versioned `key=value` string
 (enabled flag, phase, remaining seconds, last-tick wall clock, override
-deadline, configured durations) plus the PIN fields.
+deadline, configured durations) plus the PIN fields. The file is written on real
+transitions (phase change, lock/screen change, parent action) and otherwise at
+most once a minute, so it is not rewritten on every tick.
 
 On startup:
 
 * a break continues to elapse using real time since the last tick, capped at
   the remaining break time;
 * an interrupted usage phase gets no credit for the downtime;
-* backward clock jumps are ignored (the gap is not credited and time restarts
-  from "now");
-* forward jumps during usage credit at most 60 seconds per tick;
-* a missing or corrupt plist falls back to 20/30 defaults.
+* a parent pause ends at its real end time: the break it froze keeps elapsing,
+  so a break that fell due during the pause is over instead of restarting;
+* a missing or corrupt plist, or a value of the wrong type, falls back to 20/30
+  defaults and an unlocked vault rather than raising.
+
+Clock rules on every tick:
+
+* backward jumps are ignored: the gap is not credited and time restarts from
+  "now", while a parent pause keeps only the time it had left, so winding the
+  clock back cannot extend it;
+* forward jumps and the first tick after sleep credit at most 2 seconds of usage,
+  which is why usage only counts while the screen is on and unlocked.
 
 ## Safety valve
 
 The break overlay always exposes **Apel de urgență 112**. Pressing it hides the
-timeline for at most 120 seconds and opens `tel:112` through SpringBoard, so a
-real emergency call can be placed even though every other interaction is
-blocked. The overlay returns by itself if the break is still running. Blocking
-power, volume, lock or telephony is never attempted.
+timeline and opens `tel:112` through SpringBoard, so a real emergency call can
+be placed even though every other interaction is blocked. The window stays open
+only while a call is active and closes as soon as the call ends; if no call ever
+starts it closes after 15 seconds. The overlay then returns by itself while the
+break is still running. If the URL cannot be opened, the
+overlay reports `Apelul de urgență nu este disponibil pe acest dispozitiv.` in
+its subtitle instead of behind it. Blocking power, volume, lock or telephony is
+never attempted.
 
 Apple's own passcode and lock screen are untouched. If the device locks, the
 native lock screen takes over, the overlay hides, and it reappears after unlock
@@ -155,9 +169,11 @@ gcc -std=c99 -Wall -Wextra -Werror -O2 -Isrc \
 
 or simply `tests/run.sh`. The tests cover full cycle wrap-around, usage gating
 (screen off, locked, disabled), break elapse across a wall-clock gap, break
-expiry resetting the allowance, PIN-pause/resume without drift, reset and
-start-break, forward/backward clock jumps, serialization round-trip, duration
-validation and `MM:SS` formatting.
+expiry resetting the allowance, parent pauses without drift, pause expiry that
+still ends an expired break on time, backward clock jumps that cannot extend a
+pause, the capped credit on the first tick after sleep, reset and start-break,
+serialization round-trip (including override clamping), duration validation and
+`MM:SS` formatting.
 
 ## Install
 
@@ -177,6 +193,32 @@ SpringBoard; there is no app icon and no settings bundle.
 To remove it: `dpkg -r org.usageguard.timer` (or `dpkg -P` to drop the
 preferences file) followed by a respring.
 
+## Emergency recovery
+
+The tweak has a hard kill switch for a device that has become unusable. Create
+the marker file (over SSH, or with a file manager such as 3uTools):
+
+```sh
+touch /var/mobile/Library/Preferences/org.usageguard.timer.disable
+```
+
+While that file exists the tweak does nothing at all: no overlay, no swizzled
+methods (or, if they were already installed, they simply call the original), no
+usage accounting and no PIN wizard. The check runs on every 1 Hz tick, so the
+device is usable about a second after the file appears — no respring needed.
+The marker is only ever read, never created, modified or deleted by the tweak.
+
+Remove the file and respring to re-enable it (a running runtime also picks the
+removal up within a second):
+
+```sh
+rm /var/mobile/Library/Preferences/org.usageguard.timer.disable
+killall -9 SpringBoard
+```
+
+Last resorts, in order: uninstall with `dpkg -r org.usageguard.timer` and
+respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
+
 ## Troubleshooting
 
 * **No overlay appears.** Check that the package is installed, the filter plist
@@ -184,28 +226,29 @@ preferences file) followed by a respring.
   to `true` in the preferences plist enables a small number of `NSLog` lines
   (startup, hook count, corrupt state, PIN lockout) after a respring.
 * **Forgot the PIN.** There is no recovery PIN by design. Remove the package
-  and delete `/var/mobile/Library/Preferences/org.usageguard.timer.plist`, then
-  reinstall and run the first-run wizard.
+  and delete `/var/mobile/Library/Preferences/org.usageguard.timelock.plist`,
+  then reinstall and run the first-run wizard.
 * **Panel does not open from the title.** The gesture needs seven taps within
   three seconds while the break overlay is visible.
 
 ## Limitations (honest list)
 
-* **Runtime best-effort bypass resistance.** Siri activation and menu-button
-  actions are blocked by runtime swizzling restricted to `SBAssistantController
-  -activate*` and `SBUIController -handleMenuButton* / -_menuButton*`, only for
-  void methods taking at most three single-word arguments whose signatures are
-  read from the method itself. Classes/selectors absent on a given iOS 6 build
-  are skipped; the original implementation is always called when the overlay is
-  not shown. This deters casual attempts, not someone with root access, who can
-  unload the tweak or call private APIs directly.
+* **Runtime best-effort bypass resistance.** Siri / Voice Control and the home
+  button are blocked while the overlay is up by runtime swizzling of exactly two
+  methods: `SpringBoard -_menuButtonWasHeld` and
+  `SpringBoard -_handleMenuButtonEvent`. Both are void, take no arguments, and
+  their signatures are still checked at runtime before the swizzle. No prefix
+  matching is used, and nothing else on any class is touched. A selector absent
+  on a given iOS 6 build is skipped; the original implementation is always
+  called when the overlay is not shown. This deters casual attempts, not someone
+  with root access, who can unload the tweak or call private APIs directly.
 * **Not a passcode replacement.** The tweak never touches Apple's lock state
   or passcode; a locked device shows the native lock screen.
 * **Emergency valve window.** While `tel:112` is opened the timeline stays
-  hidden for up to 120 seconds (bounded, deliberate). If SpringBoard silently
-  refuses to open the URL, the timeline still returns after that window. If the
-  dialer itself is unreachable, the button reports that emergency calling is
-  unavailable.
+  hidden only while the call lasts (at most 120 seconds) or for 15 seconds when
+  no call starts. If SpringBoard silently refuses to open the URL, the timeline
+  still returns after that window. If the dialer itself is unreachable, the
+  button reports that emergency calling is unavailable inside the overlay.
 * **Calls always win.** While a call is active (incoming, outgoing or the
   emergency call itself) the overlay is suppressed, detected through the public
   read-only `CTCallCenter.currentCalls` API when the platform reports it. No telephony service is hooked,
@@ -213,17 +256,23 @@ preferences file) followed by a respring.
   ends.
 * **Clock trust.** The cycle uses wall-clock deltas with clamping as described
   above. A determined user changing the system clock can move the cycle
-  forward; backward jumps are ignored, and forward usage credit is capped.
+  forward; backward jumps are ignored, forward usage credit is capped at 2
+  seconds per tick, and a parent pause keeps only the time it had left.
 * **Break while disabled.** Disabling the tweak freezes the cycle, including a
   running break; re-enabling resumes it.
 * **SpringBoard only.** Nothing is injected into individual apps; the overlay
   is a SpringBoard-level window at `UIWindowLevelAlert + 1000` that is
-  re-raised on show and on foreground changes.
-* **Private API guards.** `SBLockScreenManager.isLocked` and
-  `SBBacklightController.screenIsOn` are queried through `NSClassFromString`
-  and `respondsToSelector:`; if either is missing, the SpringBoard Darwin
-  notifications (`hasBlankedScreen`, `lockcomplete`, `lockstate`) drive the
-  screen/lock flags instead. No private method ABI is assumed at compile time.
+  re-raised on every 1 Hz synchronisation while a break is running.
+* **Private API guards.** The lock/screen state is queried every second, best
+  source first: `SBAwayController` (`+sharedAwayController`, `-isLocked`,
+  `-isDimmed`) is the iOS 6 authority; `SBLockScreenManager.isLocked` and
+  `SBBacklightController.screenIsOn` are only the iOS 7+ second choice; the last
+  resort is the notify(3) *state* of `com.apple.springboard.lockstate` and
+  `com.apple.springboard.hasBlankedScreen` via `notify_register_check` /
+  `notify_get_state`. The notification name is never treated as a value, because
+  `lockstate` fires on both lock and unlock. When no source can answer, the
+  tweak assumes "locked, screen off": it neither counts usage nor covers the
+  screen on a guess. No private method ABI is assumed at compile time.
 * **No on-device test in this repository.** CI builds the package and runs the
   host C tests; runtime behaviour must be smoke-tested on a real jailbroken
   iOS 6.1.3 device (respring, overlay over several apps, lock/unlock, emergency

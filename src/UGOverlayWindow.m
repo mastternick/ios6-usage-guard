@@ -20,6 +20,8 @@ static const NSInteger kUGParentTapCount = 7;
     CAShapeLayer *_ringProgress;
     UILabel *_countdownLabel;
     UIButton *_emergencyButton;
+    NSString *_notice;
+    long long _remaining;
     NSInteger _titleTapCount;
     NSTimeInterval _firstTitleTapTime;
 }
@@ -93,6 +95,8 @@ static const NSInteger kUGParentTapCount = 7;
     _subtitleLabel.textAlignment = NSTextAlignmentCenter;
     _subtitleLabel.numberOfLines = 2;
     _subtitleLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    _subtitleLabel.adjustsFontSizeToFitWidth = YES;
+    _subtitleLabel.minimumScaleFactor = 0.8f;
     [_contentView addSubview:_subtitleLabel];
 
     _ringContainer = [[UIView alloc] initWithFrame:CGRectMake(centerX - 100.0f, 152.0f, 200.0f, 200.0f)];
@@ -112,7 +116,6 @@ static const NSInteger kUGParentTapCount = 7;
     _ringProgress.lineCap = kCALineCapRound;
     _ringProgress.strokeStart = 0.0f;
     _ringProgress.strokeEnd = 1.0f;
-    _ringProgress.transform = CATransform3DMakeRotation((CGFloat)-M_PI_2, 0.0f, 0.0f, 1.0f);
     [_ringContainer.layer addSublayer:_ringProgress];
 
     _countdownLabel = [[UILabel alloc] initWithFrame:CGRectMake(0.0f, 68.0f, 200.0f, 64.0f)];
@@ -148,16 +151,45 @@ static const NSInteger kUGParentTapCount = 7;
     CGPoint center = CGPointMake(CGRectGetMidX(ringBounds), CGRectGetMidY(ringBounds));
     UIBezierPath *ringPath = [UIBezierPath bezierPathWithArcCenter:center
                                                             radius:86.0f
-                                                        startAngle:0.0f
-                                                          endAngle:(CGFloat)(2.0 * M_PI)
+                                                        startAngle:(CGFloat)-M_PI_2
+                                                          endAngle:(CGFloat)(1.5 * M_PI)
                                                          clockwise:YES];
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     _gradientLayer.frame = _contentView.bounds;
+    /* Both shape layers must own the ring container's bounds and sit on its
+     * centre, otherwise the scaled arc is drawn around the container's
+     * top-left corner and lands off-screen. */
+    _ringTrack.bounds = ringBounds;
+    _ringTrack.position = center;
+    _ringProgress.bounds = ringBounds;
+    _ringProgress.position = center;
     _ringTrack.path = ringPath.CGPath;
     _ringProgress.path = ringPath.CGPath;
     [CATransaction commit];
+}
+
+- (void)refreshSubtitle
+{
+    long long minutes;
+
+    if (_notice.length > 0) {
+        _subtitleLabel.text = _notice;
+        return;
+    }
+
+    minutes = (_remaining + 59) / 60;
+    if (minutes < 1) minutes = 1;
+    _subtitleLabel.text = [NSString stringWithFormat:
+        @"Mai ai %ld minute până poți folosi telefonul.", (long)minutes];
+}
+
+- (void)showNotice:(NSString *)notice
+{
+    if (![self isViewLoaded]) [self view];
+    _notice = [notice copy];
+    [self refreshSubtitle];
 }
 
 - (void)updateLocked:(BOOL)locked
@@ -167,10 +199,15 @@ static const NSInteger kUGParentTapCount = 7;
     if (![self isViewLoaded]) [self view];
 
     _contentView.hidden = !locked;
-    if (!locked) return;
+    if (!locked) {
+        _notice = nil;
+        _remaining = 0;
+        return;
+    }
 
     if (duration <= 0) duration = 1;
     if (remaining < 0) remaining = 0;
+    _remaining = remaining;
 
     {
         char mmss[16];
@@ -181,12 +218,7 @@ static const NSInteger kUGParentTapCount = 7;
         }
     }
 
-    {
-        long long minutes = (remaining + 59) / 60;
-        if (minutes < 1) minutes = 1;
-        _subtitleLabel.text = [NSString stringWithFormat:
-            @"Mai ai %ld minute până poți folosi telefonul.", (long)minutes];
-    }
+    [self refreshSubtitle];
 
     {
         CGFloat fraction = (CGFloat)remaining / (CGFloat)duration;

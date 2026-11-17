@@ -22,6 +22,10 @@
            remaining:(long long)remaining
             duration:(long long)duration;
 
+/* Child-facing message shown in place of the minute count (for example when the
+ * emergency call cannot be dialled). Cleared when the overlay hides. */
+- (void)showNotice:(NSString *)notice;
+
 @end
 
 /* Window at UIWindowLevelAlert + 1000: above apps, alerts and the home screen. */

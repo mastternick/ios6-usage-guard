@@ -7,6 +7,5 @@
 + (instancetype)sharedRuntime;
 
 - (void)start;
-- (void)stop;
 
 @end

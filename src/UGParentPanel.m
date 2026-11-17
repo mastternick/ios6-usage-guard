@@ -27,6 +27,7 @@ static const NSUInteger kUGPINMaxLength = 8;
     NSInteger _wizardStep;
     BOOL _returnToPanel;
     BOOL _gateError;
+    NSString *_gateNotice;
 
     UIView *_gateView;
     UILabel *_gateTitle;
@@ -296,7 +297,17 @@ static const NSUInteger kUGPINMaxLength = 8;
                                        alignment:NSTextAlignmentLeft];
     enabledLabel.text = @"Usage Guard activ";
     [_panelView addSubview:enabledLabel];
-    _enabledSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(248.0f, 202.0f, 51.0f, 31.0f)];
+    _enabledSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(0.0f, 202.0f, 51.0f, 31.0f)];
+    {
+        /* On iOS 6 a UISwitch is always 79x27 and ignores the frame it was given,
+         * so the real size decides the origin: it must stay inside the 320 pt
+         * panel instead of running off the right edge. */
+        CGSize switchSize = _enabledSwitch.frame.size;
+        _enabledSwitch.frame = CGRectMake(kUGPanelWidth - 16.0f - switchSize.width,
+                                          202.0f,
+                                          switchSize.width,
+                                          switchSize.height);
+    }
     [_enabledSwitch addTarget:self
                        action:@selector(enabledSwitchChanged:)
              forControlEvents:UIControlEventValueChanged];
@@ -354,6 +365,7 @@ static const NSUInteger kUGPINMaxLength = 8;
 
     if (mode == UGPanelModeGate) {
         _gateError = NO;
+        _gateNotice = nil;
         [self refreshGateMessage];
     } else if (mode == UGPanelModePanel) {
         [self refreshStatus];
@@ -376,6 +388,10 @@ static const NSUInteger kUGPINMaxLength = 8;
     if (lockout > 0) {
         _gateMessageLabel.text = [NSString stringWithFormat:
             @"Prea multe încercări. Reîncearcă în %ld secunde.", (long)lockout];
+    } else if (_gateNotice.length > 0) {
+        /* The runtime pushes the state every second, so the validation hint has
+         * to survive refreshGateMessage instead of being wiped immediately. */
+        _gateMessageLabel.text = _gateNotice;
     } else if (_gateError) {
         _gateMessageLabel.text = @"Cod PIN greșit.";
     } else {
@@ -399,7 +415,7 @@ static const NSUInteger kUGPINMaxLength = 8;
         }
 
         {
-            long long overrideLeft = _state.overrideUntil - UGNowSeconds();
+            long long overrideLeft = ug_override_remaining(&_state, UGNowSeconds());
             if (overrideLeft > 0) {
                 ug_format_mmss(overrideLeft, mmss, sizeof mmss);
                 status = [status stringByAppendingFormat:@" · PIN %s", mmss];
@@ -429,6 +445,11 @@ static const NSUInteger kUGPINMaxLength = 8;
 {
     NSInteger tag = sender.tag;
 
+    if (_mode == UGPanelModeGate && _gateNotice.length > 0) {
+        _gateNotice = nil;
+        [self refreshGateMessage];
+    }
+
     if (tag == kUGKeypadDeleteTag) {
         if (_pinEntry.length > 0) {
             [_pinEntry deleteCharactersInRange:NSMakeRange(_pinEntry.length - 1, 1)];
@@ -453,7 +474,8 @@ static const NSUInteger kUGPINMaxLength = 8;
     if (_pinEntry.length < kUGPINMinLength) {
         if (_mode == UGPanelModeGate) {
             _gateError = NO;
-            _gateMessageLabel.text = @"Introdu 4–8 cifre.";
+            _gateNotice = @"Introdu 4–8 cifre.";
+            [self refreshGateMessage];
         } else {
             _wizardMessageLabel.text = @"Codul trebuie să aibă 4–8 cifre.";
         }
@@ -470,6 +492,7 @@ static const NSUInteger kUGPINMaxLength = 8;
         } else {
             [_pinEntry setString:@""];
             [self refreshEntryDots];
+            _gateNotice = nil;
             _gateError = YES;
             [self refreshGateMessage];
         }

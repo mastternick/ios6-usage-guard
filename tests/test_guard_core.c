@@ -179,6 +179,10 @@ static void test_clock_jumps(void)
     long long now = 5000000;
     long long jumped;
 
+    /* At 1 Hz the per-tick credit must stay small enough that a resumed phone
+     * cannot be handed a free minute. */
+    CHECK(UG_MAX_CREDIT_SECONDS <= 2);
+
     ug_state_defaults(&state, now);
 
     jumped = now + 100000;
@@ -208,6 +212,105 @@ static void test_clock_jumps(void)
     now = jumped;
     ug_tick(&state, now + 1, 1, 1);
     CHECK(state.remaining == 20 * 60 - 1);
+}
+
+/* Regression: a parent override must expire at its exact wall-clock end, so
+ * the break it paused still ends on time. The old engine rewound the clock to
+ * "now" on expiry and handed out a brand new break countdown. */
+static void test_override_expiry_keeps_real_time(void)
+{
+    UGState state;
+    long long now = 5500000;
+    int events;
+
+    ug_state_defaults(&state, now);
+    ug_start_break(&state, now);
+    ug_pause(&state, now, 15);
+    CHECK(!ug_is_locked(&state, now));
+
+    /* 15 min override + 30 min break + 90 min extra, in one tick. */
+    now += 15 * 60 + 30 * 60 + 90 * 60;
+    events = ug_tick(&state, now, 0, 0);
+    CHECK((events & UGEventOverrideEnded) != 0);
+    CHECK((events & UGEventBreakEnded) != 0);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+    CHECK(!ug_is_locked(&state, now));
+
+    /* Same clock after a restart: the break fell due while the tweak was down
+     * and must not restart from a full countdown. */
+    ug_state_defaults(&state, now);
+    ug_start_break(&state, now);
+    ug_pause(&state, now, 15);
+    ug_state_startup(&state, now + 7200);
+    events = ug_tick(&state, now + 7200, 0, 0);
+    CHECK((events & UGEventOverrideEnded) != 0);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+
+    /* Override expiring during a usage phase credits only the time after it,
+     * still bounded by the per-tick credit cap. */
+    ug_state_defaults(&state, now);
+    advance(&state, &now, 100, 1, 1);
+    ug_pause(&state, now, 15);
+    now += 15 * 60 + 10;
+    events = ug_tick(&state, now, 1, 1);
+    CHECK((events & UGEventOverrideEnded) != 0);
+    CHECK(state.remaining == 20 * 60 - 100 - UG_MAX_CREDIT_SECONDS);
+}
+
+/* Regression: setting the clock back must not extend an override. */
+static void test_backward_clock_does_not_extend_override(void)
+{
+    UGState state;
+    long long now = 1700000000; /* realistic wall clock, a year back stays > 0 */
+
+    ug_state_defaults(&state, now);
+    advance(&state, &now, 60, 1, 1);
+    ug_pause(&state, now, 15);
+    CHECK(ug_override_remaining(&state, now) == 15 * 60);
+
+    /* The overlay is hidden during an override, so the child can reach
+     * Settings and set the clock back a year. The override keeps the quarter
+     * of an hour it had left; it is not re-anchored a year into the future. */
+    now -= 365LL * 24 * 60 * 60;
+    ug_tick(&state, now, 1, 1);
+    CHECK(ug_is_overridden(&state, now));
+    CHECK(ug_override_remaining(&state, now) == 15 * 60);
+
+    /* Once those 15 minutes of the *new* clock pass, usage resumes: the year
+     * the child wound back buys nothing. */
+    advance(&state, &now, 15 * 60 + 600, 1, 1);
+    CHECK(!ug_is_overridden(&state, now));
+    CHECK(state.remaining == 20 * 60 - 60 - 600);
+
+    /* A smaller backward jump is handled the same way: 15 minutes stay 15
+     * minutes instead of growing to 20. */
+    ug_pause(&state, now, 15);
+    now -= 300;
+    ug_tick(&state, now, 1, 1);
+    CHECK(ug_override_remaining(&state, now) == 15 * 60);
+    CHECK(state.lastWall == now);
+}
+
+/* Regression: the 1 Hz timer stops while the phone sleeps; the first tick
+ * after wake must not credit the whole sleep (or a free minute of it). */
+static void test_sleep_does_not_credit_usage(void)
+{
+    UGState state;
+    long long now = 5700000;
+
+    ug_state_defaults(&state, now);
+    advance(&state, &now, 100, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 100);
+
+    now += 3600; /* asleep for an hour, one tick on wake */
+    ug_tick(&state, now, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 100 - 2);
+
+    now += 30; /* a late timer tick is bounded the same way */
+    ug_tick(&state, now, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 100 - 4);
 }
 
 static void test_startup_restore(void)
@@ -320,6 +423,10 @@ static void test_serialization_round_trip(void)
     CHECK(ug_deserialize(&restored, "v=1;usage=0;brk=9999;", 9000000) == 1);
     CHECK(restored.usageMinutes == UG_MIN_MINUTES);
     CHECK(restored.breakMinutes == UG_MAX_MINUTES);
+
+    /* A persisted override is capped at the longest pause a parent can grant. */
+    CHECK(ug_deserialize(&restored, "v=1;ovr=999999999999;", 9000000) == 1);
+    CHECK(restored.overrideUntil == 9000000 + (long long)UG_MAX_MINUTES * 60LL);
 }
 
 static void test_duration_changes(void)
@@ -384,7 +491,7 @@ static void test_disabled_break_freeze(void)
     CHECK(ug_is_locked(&state, now));
 }
 
-static void test_override_and_resume_helpers(void)
+static void test_override_helpers(void)
 {
     UGState state;
     long long now = 9300000;
@@ -397,8 +504,8 @@ static void test_override_and_resume_helpers(void)
     CHECK(ug_override_remaining(&state, now) == 60);
     CHECK(ug_is_overridden(&state, now));
 
-    now += 30;
-    ug_resume(&state, now);
+    /* The helper reports zero exactly when the override is over. */
+    now += 60;
     CHECK(!ug_is_overridden(&state, now));
     CHECK(ug_override_remaining(&state, now) == 0);
 
@@ -437,11 +544,14 @@ int main(void)
     test_override_pause_resume();
     test_reset_and_start_break();
     test_clock_jumps();
+    test_override_expiry_keeps_real_time();
+    test_backward_clock_does_not_extend_override();
+    test_sleep_does_not_credit_usage();
     test_startup_restore();
     test_serialization_round_trip();
     test_duration_changes();
     test_disabled_break_freeze();
-    test_override_and_resume_helpers();
+    test_override_helpers();
     test_mmss_formatting();
 
     if (failures != 0) {

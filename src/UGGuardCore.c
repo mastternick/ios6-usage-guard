@@ -45,28 +45,41 @@ void ug_state_startup(UGState *state, long long now)
 int ug_tick(UGState *state, long long now, int screenOn, int unlocked)
 {
     long long delta;
+    int events = UGEventNone;
 
     if (!state) return UGEventNone;
 
     if (now < state->lastWall) {
-        /* Clock stepped backwards: forget the gap instead of crediting it. */
+        /* Clock stepped backwards: forget the gap instead of crediting it.
+         * The override keeps the time it had left, measured from the new
+         * clock, so winding the clock back cannot extend it. */
+        if (state->overrideUntil > 0) {
+            long long left = state->overrideUntil - state->lastWall;
+            state->overrideUntil = left > 0 ? now + left : 0;
+        }
         state->lastWall = now;
         return UGEventNone;
     }
 
     if (state->overrideUntil > 0) {
-        if (now < state->overrideUntil) {
+        long long resumeAt = state->overrideUntil;
+
+        if (now < resumeAt) {
             state->lastWall = now; /* whole cycle frozen */
             return UGEventNone;
         }
+
+        /* The override ended at resumeAt, not at now: only the time after it
+         * may be credited, so a break that fell due meanwhile still ends at its
+         * real end instead of being handed a fresh countdown. */
         state->overrideUntil = 0;
-        state->lastWall = now; /* do not credit the paused interval */
-        return UGEventOverrideEnded;
+        if (resumeAt > state->lastWall) state->lastWall = resumeAt;
+        events |= UGEventOverrideEnded;
     }
 
     if (!state->enabled) {
         state->lastWall = now;
-        return UGEventNone;
+        return events;
     }
 
     delta = now - state->lastWall;
@@ -78,12 +91,12 @@ int ug_tick(UGState *state, long long now, int screenOn, int unlocked)
         if (state->remaining <= 0) {
             state->phase = UGPhaseUsage;
             state->remaining = (long long)state->usageMinutes * 60LL;
-            return UGEventBreakEnded;
+            return events | UGEventBreakEnded;
         }
-        return UGEventNone;
+        return events;
     }
 
-    if (!screenOn || !unlocked) return UGEventNone;
+    if (!screenOn || !unlocked) return events;
 
     if (delta > UG_MAX_CREDIT_SECONDS) delta = UG_MAX_CREDIT_SECONDS;
     if (delta > state->remaining) delta = state->remaining;
@@ -91,9 +104,9 @@ int ug_tick(UGState *state, long long now, int screenOn, int unlocked)
     if (state->remaining <= 0) {
         state->phase = UGPhaseBreak;
         state->remaining = (long long)state->breakMinutes * 60LL;
-        return UGEventBreakBegan;
+        return events | UGEventBreakBegan;
     }
-    return UGEventNone;
+    return events;
 }
 
 int ug_is_locked(const UGState *state, long long now)
@@ -142,13 +155,6 @@ void ug_pause(UGState *state, long long now, int minutes)
     if (!state) return;
     minutes = ug_clamp_int(minutes, UG_MIN_MINUTES, UG_MAX_MINUTES);
     state->overrideUntil = now + (long long)minutes * 60LL;
-    state->lastWall = now;
-}
-
-void ug_resume(UGState *state, long long now)
-{
-    if (!state) return;
-    state->overrideUntil = 0;
     state->lastWall = now;
 }
 
@@ -315,6 +321,11 @@ int ug_deserialize(UGState *state, const char *text, long long now)
     }
     if (parsed.lastWall <= 0) parsed.lastWall = now;
     if (parsed.overrideUntil < 0) parsed.overrideUntil = 0;
+    /* A persisted override can never outlive the longest pause a parent can
+     * grant, even if the file was written under a wrong clock. */
+    if (parsed.overrideUntil > now + (long long)UG_MAX_MINUTES * 60LL) {
+        parsed.overrideUntil = now + (long long)UG_MAX_MINUTES * 60LL;
+    }
 
     *state = parsed;
     return 1;

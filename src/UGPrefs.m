@@ -4,11 +4,20 @@
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonKeyDerivation.h>
 #import <Security/Security.h>
+#import <stdint.h>
 #import <stdlib.h>
 #import <string.h>
 
 static NSString *const kUGPrefsPath =
-    @"/var/mobile/Library/Preferences/org.usageguard.timer.plist";
+    @"/var/mobile/Library/Preferences/org.usageguard.timelock.plist";
+
+/*
+ * Operator kill switch. When this file exists the runtime does nothing at all
+ * (no overlay, no hooks, no accounting, no PIN wizard). It is only ever created
+ * or removed by the operator, never by the tweak itself.
+ */
+static NSString *const kUGKillSwitchPath =
+    @"/var/mobile/Library/Preferences/org.usageguard.timer.disable";
 
 static NSString *const kUGStateKey = @"State";
 static NSString *const kUGPINSaltKey = @"PINSalt";
@@ -125,15 +134,45 @@ static BOOL UGConstantTimeEqual(NSData *first, NSData *second)
     return difference == 0;
 }
 
+/*
+ * Every persisted value is untrusted: it may be a string, an array, a date or a
+ * boolean left behind by another tool. Only real numbers are read; anything
+ * else leaves the in-memory default in place instead of raising.
+ */
+static BOOL UGReadNumber(NSDictionary *values, NSString *key, long long *out)
+{
+    id value = values[key];
+
+    if (![value isKindOfClass:[NSNumber class]]) return NO;
+    *out = [(NSNumber *)value longLongValue];
+    return YES;
+}
+
 long long UGNowSeconds(void)
 {
     return (long long)[[NSDate date] timeIntervalSince1970];
+}
+
+BOOL UGKillSwitchEngaged(void)
+{
+    return [[NSFileManager defaultManager] fileExistsAtPath:kUGKillSwitchPath];
 }
 
 BOOL UGDebugLoggingEnabled(void)
 {
     return sUGDebugLogging;
 }
+
+@interface UGPrefs ()
+- (void)clampLockoutWindow;
+- (NSDictionary *)PINFieldsWithSalt:(NSData *)salt
+                               hash:(NSData *)hash
+                         iterations:(uint32_t)iterations
+                           failures:(NSInteger)failures
+                       lockoutUntil:(long long)lockoutUntil;
+- (BOOL)commitPINFields:(NSDictionary *)fields;
+- (BOOL)persistPINFields;
+@end
 
 @implementation UGPrefs {
     NSMutableDictionary *_values;
@@ -166,12 +205,44 @@ BOOL UGDebugLoggingEnabled(void)
     if ([_values[kUGPINHashKey] isKindOfClass:[NSString class]]) {
         _hash = UGBase64Decode(_values[kUGPINHashKey]);
     }
-    _iterations = [_values[kUGPINIterationsKey] unsignedIntValue];
-    _failures = [_values[kUGPINFailuresKey] integerValue];
-    _lockoutUntil = [_values[kUGPINLockoutKey] longLongValue];
+    {
+        long long number;
 
-    sUGDebugLogging = [_values[kUGDebugKey] boolValue];
+        _iterations = 0;
+        if (UGReadNumber(_values, kUGPINIterationsKey, &number) &&
+            number > 0 && number <= (long long)UINT32_MAX) {
+            _iterations = (uint32_t)number;
+        }
+
+        _failures = 0;
+        if (UGReadNumber(_values, kUGPINFailuresKey, &number) && number > 0) {
+            _failures = (number > 1000) ? 1000 : (NSInteger)number;
+        }
+
+        _lockoutUntil = 0;
+        if (UGReadNumber(_values, kUGPINLockoutKey, &number)) {
+            _lockoutUntil = number;
+        }
+
+        if (UGReadNumber(_values, kUGDebugKey, &number)) {
+            sUGDebugLogging = number != 0;
+        }
+    }
+    [self clampLockoutWindow];
     return self;
+}
+
+/* The lockout is a wall-clock deadline and the clock can move. Never trust it
+ * for longer than the maximum lockout the tweak itself hands out. */
+- (void)clampLockoutWindow
+{
+    long long now = UGNowSeconds();
+    long long remaining = _lockoutUntil - now;
+
+    if (remaining > (long long)kUGPINMaxLockoutSeconds) {
+        _lockoutUntil = now + kUGPINMaxLockoutSeconds;
+        UGLog(@"Usage Guard: PIN lockout clamped to the maximum window");
+    }
 }
 
 - (BOOL)writeValues
@@ -243,14 +314,60 @@ BOOL UGDebugLoggingEnabled(void)
     return YES;
 }
 
+/* The plist entries that describe the PIN vault, built from explicit values so
+ * callers never have to mutate the ivars before the write is known to work. */
+- (NSDictionary *)PINFieldsWithSalt:(NSData *)salt
+                               hash:(NSData *)hash
+                         iterations:(uint32_t)iterations
+                           failures:(NSInteger)failures
+                       lockoutUntil:(long long)lockoutUntil
+{
+    return @{
+        kUGPINSaltKey: salt ? UGBase64Encode(salt) : @"",
+        kUGPINHashKey: hash ? UGBase64Encode(hash) : @"",
+        kUGPINIterationsKey: @(iterations),
+        kUGPINFailuresKey: @(failures),
+        kUGPINLockoutKey: @(lockoutUntil)
+    };
+}
+
+/* Persists the given PIN entries. A failed write restores the previous entries,
+ * so the file on disk and the values in memory never disagree. */
+- (BOOL)commitPINFields:(NSDictionary *)fields
+{
+    NSArray *keys = @[kUGPINSaltKey, kUGPINHashKey, kUGPINIterationsKey,
+                      kUGPINFailuresKey, kUGPINLockoutKey];
+    NSMutableDictionary *previous = [NSMutableDictionary dictionary];
+    BOOL written;
+
+    for (NSString *key in keys) {
+        id value = _values[key];
+        previous[key] = value ? value : (id)[NSNull null];
+    }
+
+    [_values addEntriesFromDictionary:fields];
+    written = [self writeValues];
+    if (!written) {
+        for (NSString *key in keys) {
+            id value = previous[key];
+            if (value == [NSNull null]) {
+                [_values removeObjectForKey:key];
+            } else {
+                _values[key] = value;
+            }
+        }
+    }
+    return written;
+}
+
 - (BOOL)persistPINFields
 {
-    _values[kUGPINSaltKey] = _salt ? UGBase64Encode(_salt) : @"";
-    _values[kUGPINHashKey] = _hash ? UGBase64Encode(_hash) : @"";
-    _values[kUGPINIterationsKey] = @(_iterations);
-    _values[kUGPINFailuresKey] = @(_failures);
-    _values[kUGPINLockoutKey] = @(_lockoutUntil);
-    return [self writeValues];
+    return [self commitPINFields:
+        [self PINFieldsWithSalt:_salt
+                           hash:_hash
+                     iterations:_iterations
+                       failures:_failures
+                   lockoutUntil:_lockoutUntil]];
 }
 
 - (BOOL)setPIN:(NSString *)pin
@@ -258,6 +375,7 @@ BOOL UGDebugLoggingEnabled(void)
     unsigned char rawSalt[kUGPINSaltLength];
     NSData *salt;
     NSData *hash;
+    NSDictionary *fields;
 
     if (![[self class] isValidPIN:pin]) return NO;
 
@@ -272,21 +390,33 @@ BOOL UGDebugLoggingEnabled(void)
     hash = UGDerivePIN(pin, salt, kUGPINIterations);
     if (!hash) return NO;
 
+    fields = [self PINFieldsWithSalt:salt
+                               hash:hash
+                         iterations:kUGPINIterations
+                           failures:0
+                       lockoutUntil:0];
+    if (![self commitPINFields:fields]) return NO;
+
+    /* Only now is the new PIN live: a failed write must leave the old one
+     * working instead of diverging from the file until the next respring. */
     _salt = salt;
     _hash = hash;
     _iterations = kUGPINIterations;
     _failures = 0;
     _lockoutUntil = 0;
-    return [self persistPINFields];
+    return YES;
 }
 
 - (BOOL)verifyPIN:(NSString *)pin
 {
-    long long now = UGNowSeconds();
+    long long now;
     NSData *candidate;
 
     if (![self hasPIN]) return NO;
     if (![[self class] isValidPIN:pin]) return NO;
+
+    [self clampLockoutWindow];
+    now = UGNowSeconds();
     if (_lockoutUntil > now) return NO;
 
     candidate = UGDerivePIN(pin, _salt, _iterations);
@@ -297,7 +427,7 @@ BOOL UGDebugLoggingEnabled(void)
         return YES;
     }
 
-    _failures += 1;
+    if (_failures < 1000) _failures += 1;
     if (_failures % kUGPINFailuresPerLockout == 0) {
         NSInteger level = _failures / kUGPINFailuresPerLockout;
         NSInteger seconds = kUGPINBaseLockoutSeconds << MIN(level - 1, 4);
@@ -311,7 +441,10 @@ BOOL UGDebugLoggingEnabled(void)
 
 - (NSInteger)PINLockoutRemainingSeconds
 {
-    long long remaining = _lockoutUntil - UGNowSeconds();
+    long long remaining;
+
+    [self clampLockoutWindow];
+    remaining = _lockoutUntil - UGNowSeconds();
     return remaining > 0 ? (NSInteger)remaining : 0;
 }
 

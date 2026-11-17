@@ -2,8 +2,9 @@
 
 #import <CoreTelephony/CTCallCenter.h>
 #import <UIKit/UIKit.h>
-#import <objc/message.h>
+#import <notify.h>
 #import <objc/runtime.h>
+#import <stdint.h>
 #import <stdlib.h>
 
 #import "UGGuardCore.h"
@@ -15,40 +16,47 @@ static NSString *const kUGNotificationScreenBlanked = @"com.apple.springboard.ha
 static NSString *const kUGNotificationLockComplete = @"com.apple.springboard.lockcomplete";
 static NSString *const kUGNotificationLockState = @"com.apple.springboard.lockstate";
 
-static const long long kUGEmergencyWindowSeconds = 120;
-static const long long kUGPersistIntervalSeconds = 5;
-enum { kUGMaxHooks = 16 };
+/* Escape window for a real emergency call, and the upper bound while one runs. */
+static const long long kUGEmergencyNoCallSeconds = 15;
+static const long long kUGEmergencyCallSeconds = 120;
+
+/* At most one state write per minute unless something actually happened. */
+static const long long kUGPersistIntervalSeconds = 60;
+enum { kUGMaxHooks = 4 };
 
 /*
- * Very narrow swizzle allowlist: Siri activation and the home-button menu
- * actions. Power, volume, lock and telephony are never touched. Only methods
- * that return void and take at most three single-word arguments are hooked
- * (checked at runtime from the method's own type encoding).
+ * Very narrow swizzle allowlist, by exact class and selector. On iOS 6 the home
+ * button handlers live on SpringBoard itself: SBAssistantController only has
+ * -activateIgnoringTouches (non-void) and SBUIController has no menu-button
+ * methods at all. Power, volume, lock and telephony are never touched. Only
+ * methods that return void and take at most three single-word arguments are
+ * hooked (checked at runtime from the method's own type encoding).
  */
 typedef struct {
     const char *className;
-    const char *selectorPrefix;
+    const char *selectorName;
 } UGAllowlistEntry;
 
 static const UGAllowlistEntry kUGAllowlist[] = {
-    { "SBAssistantController", "activate" },
-    { "SBUIController", "handleMenuButton" },
-    { "SBUIController", "_menuButton" }
+    { "SpringBoard", "_menuButtonWasHeld" },    /* Siri / Voice Control */
+    { "SpringBoard", "_handleMenuButtonEvent" } /* menu button events */
 };
 
 typedef struct {
     SEL selector;
     __unsafe_unretained Class cls;
     IMP original;
-    int arity;
 } UGHookEntry;
 
 static UGHookEntry sUGHooks[kUGMaxHooks];
 static NSInteger sUGHookCount = 0;
-static BOOL sUGHooksInstalled = NO;
 static volatile int sUGOverlayLocked = 0;
 
-static IMP UGOriginalImplementation(id self, SEL selector)
+/* notify(3) check tokens; -1 until the first successful registration. */
+static int sUGLockStateToken = -1;
+static int sUGBlankedToken = -1;
+
+static IMP UGOriginalImplementation(__unsafe_unretained id self, SEL selector)
 {
     for (NSInteger index = 0; index < sUGHookCount; index++) {
         if (sUGHooks[index].selector != selector) continue;
@@ -59,43 +67,50 @@ static IMP UGOriginalImplementation(id self, SEL selector)
     return NULL;
 }
 
-/* One forwarder per arity keeps the original call signature exact: all the
- * allowlisted argument types are single 32-bit words, so passing them as id
- * preserves the bits. */
-static void UGHook0(id self, SEL selector)
+/*
+ * One forwarder per arity, ABI-exact for the original method: `self` is
+ * __unsafe_unretained and every extra argument is uintptr_t, the single word
+ * the hook slot really holds. ARC must never retain or release a scalar, and
+ * the original IMP is cast to the identical signature.
+ */
+static void UGHook0(__unsafe_unretained id self, SEL selector)
 {
     IMP original;
     if (sUGOverlayLocked) return;
     original = UGOriginalImplementation(self, selector);
     if (!original) return;
-    ((void (*)(id, SEL))original)(self, selector);
+    ((void (*)(__unsafe_unretained id, SEL))original)(self, selector);
 }
 
-static void UGHook1(id self, SEL selector, id first)
+static void UGHook1(__unsafe_unretained id self, SEL selector, uintptr_t first)
 {
     IMP original;
     if (sUGOverlayLocked) return;
     original = UGOriginalImplementation(self, selector);
     if (!original) return;
-    ((void (*)(id, SEL, id))original)(self, selector, first);
+    ((void (*)(__unsafe_unretained id, SEL, uintptr_t))original)(self, selector, first);
 }
 
-static void UGHook2(id self, SEL selector, id first, id second)
+static void UGHook2(__unsafe_unretained id self, SEL selector,
+                    uintptr_t first, uintptr_t second)
 {
     IMP original;
     if (sUGOverlayLocked) return;
     original = UGOriginalImplementation(self, selector);
     if (!original) return;
-    ((void (*)(id, SEL, id, id))original)(self, selector, first, second);
+    ((void (*)(__unsafe_unretained id, SEL, uintptr_t, uintptr_t))original)(
+        self, selector, first, second);
 }
 
-static void UGHook3(id self, SEL selector, id first, id second, id third)
+static void UGHook3(__unsafe_unretained id self, SEL selector,
+                    uintptr_t first, uintptr_t second, uintptr_t third)
 {
     IMP original;
     if (sUGOverlayLocked) return;
     original = UGOriginalImplementation(self, selector);
     if (!original) return;
-    ((void (*)(id, SEL, id, id, id))original)(self, selector, first, second, third);
+    ((void (*)(__unsafe_unretained id, SEL, uintptr_t, uintptr_t, uintptr_t))original)(
+        self, selector, first, second, third);
 }
 
 static IMP UGHookFunctionForArity(int arity)
@@ -156,26 +171,97 @@ static void UGInstallHook(Class cls, Method method, int arity)
     sUGHooks[sUGHookCount].selector = selector;
     sUGHooks[sUGHookCount].cls = cls;
     sUGHooks[sUGHookCount].original = method_getImplementation(method);
-    sUGHooks[sUGHookCount].arity = arity;
     sUGHookCount++;
     method_setImplementation(method, replacement);
 }
 
-static void UGUninstallHooks(void)
+/*
+ * Compile-time shapes of the private SpringBoard classes that are only queried.
+ * The factories are declared on the protocols, so the receiver is a
+ * protocol-qualified Class and every call is an ordinary typed message send:
+ * no objc_msgSend casts and no ARC retain or release of anything that is not
+ * provably an object. Each use is still guarded by respondsToSelector:.
+ */
+@protocol UGAwayControllerProbe <NSObject>
++ (id)sharedAwayController;
+- (BOOL)isLocked;
+- (BOOL)isDimmed;
+@end
+
+@protocol UGBacklightProbe <NSObject>
++ (id)sharedInstance;
+- (BOOL)screenIsOn;
+@end
+
+@protocol UGLockScreenProbe <NSObject>
++ (id)sharedInstance;
+- (BOOL)isLocked;
+@end
+
+/*
+ * Private-state probes, best first for iOS 6:
+ *   1. SBAwayController (iOS 5/6): +sharedAwayController, -isLocked, -isDimmed.
+ *   2. SBLockScreenManager / SBBacklightController (iOS 7+; absent on target).
+ *   3. notify(3) state of lockstate / hasBlankedScreen.
+ * The notification *name* is never used as a value: lockstate fires on lock and
+ * on unlock alike, so the name alone cannot say which way the state moved.
+ */
+static BOOL UGAwayControllerLocked(BOOL *locked, BOOL *dimmed)
 {
-    for (NSInteger index = sUGHookCount - 1; index >= 0; index--) {
-        Method method = class_getInstanceMethod(sUGHooks[index].cls, sUGHooks[index].selector);
-        if (method && method_getImplementation(method) ==
-                      UGHookFunctionForArity(sUGHooks[index].arity)) {
-            method_setImplementation(method, sUGHooks[index].original);
-        }
-        sUGHooks[index].selector = NULL;
-        sUGHooks[index].cls = Nil;
-        sUGHooks[index].original = NULL;
-        sUGHooks[index].arity = 0;
+    Class cls = NSClassFromString(@"SBAwayController");
+    id<UGAwayControllerProbe> controller;
+
+    if (!cls) return NO;
+    if (![(id)cls respondsToSelector:@selector(sharedAwayController)]) return NO;
+    controller = [(id<UGAwayControllerProbe>)cls sharedAwayController];
+    if (!controller) return NO;
+
+    *locked = [controller isLocked];
+    *dimmed = [controller respondsToSelector:@selector(isDimmed)]
+        ? [controller isDimmed]
+        : NO;
+    return YES;
+}
+
+static BOOL UGBacklightScreenOn(BOOL *on)
+{
+    Class cls = NSClassFromString(@"SBBacklightController");
+    id<UGBacklightProbe> controller;
+
+    if (!cls) return NO;
+    if (![(id)cls respondsToSelector:@selector(sharedInstance)]) return NO;
+    controller = [(id<UGBacklightProbe>)cls sharedInstance];
+    if (!controller || ![controller respondsToSelector:@selector(screenIsOn)]) return NO;
+
+    *on = [controller screenIsOn];
+    return YES;
+}
+
+static BOOL UGLockScreenManagerLocked(BOOL *locked)
+{
+    Class cls = NSClassFromString(@"SBLockScreenManager");
+    id<UGLockScreenProbe> manager;
+
+    if (!cls) return NO;
+    if (![(id)cls respondsToSelector:@selector(sharedInstance)]) return NO;
+    manager = [(id<UGLockScreenProbe>)cls sharedInstance];
+    if (!manager || ![manager respondsToSelector:@selector(isLocked)]) return NO;
+
+    *locked = [manager isLocked];
+    return YES;
+}
+
+static BOOL UGNotificationStateValue(const char *name, int *token, BOOL *value)
+{
+    uint64_t state = 0;
+
+    if (*token < 0 && notify_register_check(name, token) != NOTIFY_STATUS_OK) {
+        *token = -1;
+        return NO;
     }
-    sUGHookCount = 0;
-    sUGHooksInstalled = NO;
+    if (notify_get_state(*token, &state) != NOTIFY_STATUS_OK) return NO;
+    *value = state != 0;
+    return YES;
 }
 
 static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
@@ -209,10 +295,14 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     BOOL _panelPresented;
 
     BOOL _started;
+    BOOL _activated;
+    BOOL _inert;
     BOOL _screenOn;
     BOOL _unlocked;
+    BOOL _callActive;
 
     long long _emergencyUntil;
+    BOOL _emergencyCallSeen;
     long long _lastPersistWall;
     NSString *_savedStateString;
     CTCallCenter *_callCenter;
@@ -238,69 +328,77 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     _prefs = [UGPrefs sharedPrefs];
     [_prefs loadState:&_state now:UGNowSeconds()];
 
-    _screenOn = YES;
-    _unlocked = YES;
-    [self refreshDeviceStateFromNotification:nil];
+    /* Nothing about the device is assumed: both flags stay NO until a real
+     * query says otherwise, so usage can never be credited at the lock screen
+     * and the overlay can never cover it. */
+    _screenOn = NO;
+    _unlocked = NO;
 
-    [self registerDarwinNotifications];
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(applicationDidBecomeActive:)
-                                                 name:UIApplicationDidBecomeActiveNotification
-                                               object:nil];
+    if (![self enterInertModeIfNeeded]) [self activate];
 
-    [self installBypassHooks];
-    [self ensureWindow];
-
+    /* The clock runs even while inert: it is what notices the operator
+     * removing the disable marker, and it performs no accounting then. */
     _timer = [NSTimer timerWithTimeInterval:1.0
                                      target:self
                                    selector:@selector(tick)
                                    userInfo:nil
                                     repeats:YES];
     [[NSRunLoop mainRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
+}
+
+/* Installs hooks, notifications and the window. Idempotent. */
+- (void)activate
+{
+    if (!_activated) {
+        _activated = YES;
+        [self refreshDeviceState];
+        [self refreshCallActive];
+        [self registerDarwinNotifications];
+        [self installBypassHooks];
+        [self ensureWindow];
+    }
 
     _needsFirstRunWizard = ![_prefs hasPIN];
 
     [self syncUI];
-    [self persistIfChanged];
+    [self persistIfChanged:YES];
 }
 
-- (void)stop
+/*
+ * Operator escape hatch. Returns YES while the runtime must stay inert: no
+ * overlay, no hooks installed (an already installed one simply forwards), no
+ * accounting and no PIN wizard. The marker file is never created or removed
+ * here.
+ */
+- (BOOL)enterInertModeIfNeeded
 {
-    if (!_started) return;
-    _started = NO;
+    if (!UGKillSwitchEngaged()) {
+        if (!_inert) return NO;
+        _inert = NO;
+        UGLog(@"Usage Guard: disable marker removed, resuming");
+        /* The inert interval is not credited to usage; a break keeps elapsing. */
+        ug_state_startup(&_state, UGNowSeconds());
+        [self activate];
+        return NO;
+    }
 
-    [_timer invalidate];
-    _timer = nil;
+    if (!_inert) {
+        _inert = YES;
+        sUGOverlayLocked = 0;
+        _emergencyUntil = 0;
+        _emergencyCallSeen = NO;
+        _needsFirstRunWizard = NO;
 
-    [NSObject cancelPreviousPerformRequestsWithTarget:self];
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-
-    {
-        CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
-        NSArray *names = @[kUGNotificationScreenBlanked,
-                           kUGNotificationLockComplete,
-                           kUGNotificationLockState];
-        for (NSString *name in names) {
-            CFNotificationCenterRemoveObserver(center,
-                                               (__bridge const void *)self,
-                                               (__bridge CFStringRef)name,
-                                               NULL);
+        if (_panelPresented) {
+            _panelPresented = NO;
+            _panel = nil;
+            [_window.overlayController dismissViewControllerAnimated:NO completion:nil];
         }
+        [_window.overlayController updateLocked:NO remaining:0 duration:0];
+        [_window setHidden:YES];
+        UGLog(@"Usage Guard: disable marker present, tweak is inert");
     }
-
-    [self persistIfChanged];
-
-    if (_panelPresented) {
-        _panelPresented = NO;
-        _panel = nil;
-        [_window.overlayController dismissViewControllerAnimated:NO completion:nil];
-    }
-
-    sUGOverlayLocked = 0;
-    [_window setHidden:YES];
-    _window = nil;
-
-    UGUninstallHooks();
+    return YES;
 }
 
 #pragma mark - Clock
@@ -309,10 +407,19 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 {
     long long now;
     int events;
+    BOOL wasScreenOn;
+    BOOL wasUnlocked;
+
+    if ([self enterInertModeIfNeeded]) return;
+
+    wasScreenOn = _screenOn;
+    wasUnlocked = _unlocked;
 
     /* Re-query every second so a missed unlock notification cannot leave the
-     * overlay hidden for the rest of a break. */
-    [self refreshDeviceStateFromNotification:nil];
+     * overlay hidden — or on the lock screen — for the rest of a break. */
+    [self refreshDeviceState];
+    [self refreshCallActive];
+    [self updateEmergencyState];
 
     now = UGNowSeconds();
     events = ug_tick(&_state, now, _screenOn ? 1 : 0, _unlocked ? 1 : 0);
@@ -320,9 +427,9 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     [self syncUI];
     [self pushStateToPanel];
 
-    if (events != UGEventNone || now - _lastPersistWall >= kUGPersistIntervalSeconds) {
-        [self persistIfChanged];
-    }
+    [self persistIfChanged:(events != UGEventNone ||
+                            _screenOn != wasScreenOn ||
+                            _unlocked != wasUnlocked)];
 
     if (_needsFirstRunWizard && !_panelPresented && _screenOn && _unlocked) {
         _needsFirstRunWizard = NO;
@@ -330,18 +437,28 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     }
 }
 
-- (void)persistIfChanged
+/*
+ * `forced` marks a real transition (phase change, lock/screen change, parent
+ * action). Everything else is rate limited, so the plist is not rewritten every
+ * second just because the wall clock moved.
+ */
+- (void)persistIfChanged:(BOOL)forced
 {
     char buffer[UG_STATE_BUFFER_SIZE];
     NSString *encoded;
+    long long now;
 
+    if (!_prefs) return;
     if (ug_serialize(&_state, buffer, sizeof buffer) == 0) return;
     encoded = [NSString stringWithUTF8String:buffer];
     if (_savedStateString && [encoded isEqualToString:_savedStateString]) return;
 
+    now = UGNowSeconds();
+    if (!forced && now - _lastPersistWall < kUGPersistIntervalSeconds) return;
+
     if ([_prefs saveState:&_state]) {
         _savedStateString = encoded;
-        _lastPersistWall = UGNowSeconds();
+        _lastPersistWall = now;
     }
 }
 
@@ -355,10 +472,34 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 }
 
 /* Read-only telephony state: the overlay must never cover an active call. */
-- (BOOL)isCallActive
+- (void)refreshCallActive
 {
     if (!_callCenter) _callCenter = [[CTCallCenter alloc] init];
-    return _callCenter.currentCalls.count > 0;
+    _callActive = _callCenter.currentCalls.count > 0;
+}
+
+/*
+ * Closes the emergency escape window as soon as the call ends, or after
+ * kUGEmergencyNoCallSeconds when no call ever started: dialling 112 and hanging
+ * up must not keep the overlay away.
+ */
+- (void)updateEmergencyState
+{
+    long long now;
+
+    if (_emergencyUntil <= 0) return;
+
+    now = UGNowSeconds();
+    if (_callActive) {
+        _emergencyCallSeen = YES;
+        _emergencyUntil = now + kUGEmergencyCallSeconds;
+        return;
+    }
+
+    if (_emergencyCallSeen || now >= _emergencyUntil) {
+        _emergencyUntil = 0;
+        _emergencyCallSeen = NO;
+    }
 }
 
 - (void)syncUI
@@ -366,7 +507,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     long long now = UGNowSeconds();
     BOOL emergency = _emergencyUntil > now;
     BOOL locked = ug_is_locked(&_state, now) && _screenOn && _unlocked &&
-                  !emergency && ![self isCallActive];
+                  !emergency && !_callActive;
 
     sUGOverlayLocked = locked ? 1 : 0;
 
@@ -449,7 +590,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 - (void)panelApplyState:(UGState)state
 {
     _state = state;
-    [self persistIfChanged];
+    [self persistIfChanged:YES];
     [self syncUI];
 }
 
@@ -472,97 +613,93 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
     (void)controller;
 
-    /* Safety valve: the timeline is hidden for a bounded window so a real call
-     * can be placed even though every other interaction is blocked. */
-    _emergencyUntil = UGNowSeconds() + kUGEmergencyWindowSeconds;
+    /* Safety valve: the timeline steps aside for a short window so a real call
+     * can be dialled. The window closes when the call ends (or after 15 s when
+     * no call starts), so tapping and hanging up is not a way to stay out. */
+    _emergencyUntil = UGNowSeconds() + kUGEmergencyNoCallSeconds;
+    _emergencyCallSeen = NO;
     sUGOverlayLocked = 0;
     [_window setHidden:YES];
 
     emergencyURL = [NSURL URLWithString:@"tel:112"];
     if (![[UIApplication sharedApplication] canOpenURL:emergencyURL]) {
-        UIAlertView *alert;
         _emergencyUntil = 0;
+        /* The alert window sits below the overlay window, so the message has to
+         * live inside the overlay itself to be readable. */
+        [self ensureWindow];
+        [_window.overlayController
+            showNotice:@"Apelul de urgență nu este disponibil pe acest dispozitiv."];
         [self syncUI];
-        alert = [[UIAlertView alloc] initWithTitle:@"Apel de urgență"
-                                         message:@"Apelul de urgență nu este disponibil pe acest dispozitiv."
-                                        delegate:nil
-                               cancelButtonTitle:@"OK"
-                               otherButtonTitles:nil];
-        [alert show];
         return;
     }
 
     [[UIApplication sharedApplication] openURL:emergencyURL];
-    [self persistIfChanged];
+    [self persistIfChanged:YES];
 }
 
 #pragma mark - Device state
 
-- (void)refreshDeviceStateFromNotification:(NSString *)notification
+/*
+ * Builds the real device state from private queries, never from the
+ * notification name. Anything that cannot be determined is treated as "not
+ * usable": no usage credit and no overlay on a guess.
+ */
+- (void)refreshDeviceState
 {
-    BOOL queriedScreen = NO;
-    BOOL queriedLock = NO;
-    BOOL screenOn = _screenOn;
-    BOOL unlocked = _unlocked;
+    BOOL locked = NO;
+    BOOL dimmed = NO;
+    BOOL value = NO;
+    BOOL unlockKnown = NO;
+    BOOL screenKnown = NO;
 
-    {
-        Class backlightClass = NSClassFromString(@"SBBacklightController");
-        if (backlightClass && [backlightClass respondsToSelector:@selector(sharedInstance)]) {
-            id controller = [backlightClass performSelector:@selector(sharedInstance)];
-            SEL selector = NSSelectorFromString(@"screenIsOn");
-            if (controller && [controller respondsToSelector:selector]) {
-                screenOn = ((BOOL (*)(id, SEL))objc_msgSend)(controller, selector);
-                queriedScreen = YES;
-            }
+    /* 1. iOS 5/6 away controller: authoritative for the lock state. */
+    if (UGAwayControllerLocked(&locked, &dimmed)) {
+        _unlocked = !locked;
+        unlockKnown = YES;
+        if (locked) {
+            _screenOn = !dimmed;
+            screenKnown = YES;
         }
     }
 
-    {
-        Class lockScreenClass = NSClassFromString(@"SBLockScreenManager");
-        if (lockScreenClass && [lockScreenClass respondsToSelector:@selector(sharedInstance)]) {
-            id manager = [lockScreenClass performSelector:@selector(sharedInstance)];
-            SEL selector = NSSelectorFromString(@"isLocked");
-            if (manager && [manager respondsToSelector:selector]) {
-                unlocked = !((BOOL (*)(id, SEL))objc_msgSend)(manager, selector);
-                queriedLock = YES;
-            }
-        }
+    /* 2. iOS 7+ controllers; absent on the target device. */
+    if (!screenKnown && UGBacklightScreenOn(&value)) {
+        _screenOn = value;
+        screenKnown = YES;
+    }
+    if (!unlockKnown && UGLockScreenManagerLocked(&value)) {
+        _unlocked = !value;
+        unlockKnown = YES;
     }
 
-    /* Conservative fallback for iOS 6 builds without these controllers: the
-     * lock notifications are the only signal available. */
-    if (!queriedScreen) {
-        if ([notification isEqualToString:kUGNotificationScreenBlanked] ||
-            [notification isEqualToString:kUGNotificationLockComplete]) {
-            screenOn = NO;
-        } else if ([notification isEqualToString:kUGNotificationLockState]) {
-            screenOn = YES;
-        }
+    /* 3. Last resort on iOS 6: the notify(3) *state* of the same notifications
+     *    says whether the phone is locked or the screen is blanked. */
+    if (!unlockKnown &&
+        UGNotificationStateValue(kUGNotifyLockState, &sUGLockStateToken, &value)) {
+        _unlocked = !value;
+        unlockKnown = YES;
     }
-    if (!queriedLock) {
-        if ([notification isEqualToString:kUGNotificationLockComplete]) {
-            unlocked = NO;
-        } else if ([notification isEqualToString:kUGNotificationLockState]) {
-            unlocked = YES;
-        }
+    if (!screenKnown &&
+        UGNotificationStateValue(kUGNotifyBlankedScreen, &sUGBlankedToken, &value)) {
+        _screenOn = !value;
+        screenKnown = YES;
     }
 
-    _screenOn = screenOn;
-    _unlocked = unlocked;
+    if (!unlockKnown) _unlocked = NO;
+    if (!screenKnown) _screenOn = NO;
 }
 
 - (void)handleDarwinNotification:(NSString *)name
 {
-    [self refreshDeviceStateFromNotification:name];
-    if (!_unlocked && _panelPresented) [self dismissPanel];
-    [self persistIfChanged];
-    [self syncUI];
-}
+    BOOL wasScreenOn = _screenOn;
+    BOOL wasUnlocked = _unlocked;
 
-- (void)applicationDidBecomeActive:(NSNotification *)notification
-{
-    (void)notification;
-    [self refreshDeviceStateFromNotification:nil];
+    (void)name;
+    if ([self enterInertModeIfNeeded]) return;
+
+    [self refreshDeviceState];
+    if (!_unlocked && _panelPresented) [self dismissPanel];
+    [self persistIfChanged:(_screenOn != wasScreenOn || _unlocked != wasUnlocked)];
     [self syncUI];
 }
 
@@ -587,35 +724,21 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
 - (void)installBypassHooks
 {
-    if (sUGHooksInstalled) return;
-    sUGHooksInstalled = YES;
-
+    /* Exact class/selector pairs only: no prefix matching, so a future SpringBoard
+     * method that happens to start the same way is never swizzled by accident. */
     for (size_t entry = 0; entry < sizeof(kUGAllowlist) / sizeof(kUGAllowlist[0]); entry++) {
         Class targetClass = NSClassFromString(
             [NSString stringWithUTF8String:kUGAllowlist[entry].className]);
-        NSString *prefix =
-            [NSString stringWithUTF8String:kUGAllowlist[entry].selectorPrefix];
+        SEL selector = NSSelectorFromString(
+            [NSString stringWithUTF8String:kUGAllowlist[entry].selectorName]);
+        Method method;
+        int arity = 0;
 
         if (!targetClass) continue;
-
-        for (Class current = targetClass;
-             current && current != [NSObject class];
-             current = class_getSuperclass(current)) {
-            unsigned int methodCount = 0;
-            Method *methods = class_copyMethodList(current, &methodCount);
-            if (!methods) continue;
-
-            for (unsigned int index = 0; index < methodCount; index++) {
-                Method method = methods[index];
-                NSString *name = NSStringFromSelector(method_getName(method));
-                int arity = 0;
-
-                if (![name hasPrefix:prefix]) continue;
-                if (!UGMethodIsBlockable(method, &arity)) continue;
-                UGInstallHook(current, method, arity);
-            }
-            free(methods);
-        }
+        method = class_getInstanceMethod(targetClass, selector);
+        if (!method) continue;
+        if (!UGMethodIsBlockable(method, &arity)) continue;
+        UGInstallHook(targetClass, method, arity);
     }
 
     UGLog(@"Usage Guard: %ld bypass hook(s) installed", (long)sUGHookCount);

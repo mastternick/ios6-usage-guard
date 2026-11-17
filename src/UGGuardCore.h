@@ -53,7 +53,10 @@ void ug_state_defaults(UGState *state, long long now);
 void ug_state_startup(UGState *state, long long now);
 
 /* Advances the machine. screenOn/unlocked gate usage accrual only; a break
- * always elapses in real time. Returns a mask of UGEvent bits. */
+ * always elapses in real time. A parent override is anchored in wall time: it
+ * expires at exactly overrideUntil, so the break it paused still ends on time,
+ * and a backwards clock jump shrinks it instead of extending it. Returns a
+ * mask of UGEvent bits. */
 int ug_tick(UGState *state, long long now, int screenOn, int unlocked);
 
 /* True when the overlay must be visible. */
@@ -65,7 +68,6 @@ long long ug_override_remaining(const UGState *state, long long now);
 void ug_reset(UGState *state, long long now);
 void ug_start_break(UGState *state, long long now);
 void ug_pause(UGState *state, long long now, int minutes);
-void ug_resume(UGState *state, long long now);
 void ug_set_enabled(UGState *state, int enabled, long long now);
 void ug_set_usage_minutes(UGState *state, int minutes);
 void ug_set_break_minutes(UGState *state, int minutes);

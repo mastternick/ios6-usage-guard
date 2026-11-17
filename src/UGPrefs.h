@@ -38,6 +38,13 @@
 /* Wall clock shared by the tweak's timer, the panel and the PIN lockout. */
 long long UGNowSeconds(void);
 
+/*
+ * Operator escape hatch: YES when the disable marker file exists. The runtime
+ * must then do nothing at all — no overlay, no hooks, no accounting, no wizard.
+ * The tweak never creates or removes the marker.
+ */
+BOOL UGKillSwitchEngaged(void);
+
 /* Opt-in diagnostics, enabled by a "DebugLogging" boolean in the tweak plist. */
 BOOL UGDebugLoggingEnabled(void);
 #define UGLog(...) do { if (UGDebugLoggingEnabled()) NSLog(__VA_ARGS__); } while (0)
