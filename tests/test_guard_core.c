@@ -1,0 +1,453 @@
+/*
+ * test_guard_core.c - host-side tests for the pure C cycle engine.
+ * Plain C, no framework: every check returns a failure line on violation.
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include "UGGuardCore.h"
+
+static int failures = 0;
+
+#define CHECK(condition)                                                        \
+    do {                                                                        \
+        if (!(condition)) {                                                     \
+            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition);\
+            failures++;                                                         \
+            return;                                                             \
+        }                                                                       \
+    } while (0)
+
+/* Feeds one tick per simulated second so the per-tick credit cap never hides
+ * a behaviour under test. Returns the OR of all events produced. */
+static int advance(UGState *state, long long *now, long long seconds,
+                   int screenOn, int unlocked)
+{
+    long long index;
+    int events = UGEventNone;
+    for (index = 0; index < seconds; index++) {
+        *now += 1;
+        events |= ug_tick(state, *now, screenOn, unlocked);
+    }
+    return events;
+}
+
+static void test_full_cycle_wrap(void)
+{
+    UGState state;
+    long long now = 1000000;
+    int events;
+
+    ug_state_defaults(&state, now);
+    CHECK(state.enabled == 1);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+
+    events = advance(&state, &now, 1199, 1, 1);
+    CHECK(events == UGEventNone);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 1);
+
+    events = advance(&state, &now, 1, 1, 1);
+    CHECK(events == UGEventBreakBegan);
+    CHECK(state.phase == UGPhaseBreak);
+    CHECK(state.remaining == 30 * 60);
+    CHECK(ug_is_locked(&state, now));
+
+    /* The screen being on during a break must not shorten it. */
+    events = advance(&state, &now, 300, 1, 1);
+    CHECK(events == UGEventNone);
+    CHECK(state.remaining == 30 * 60 - 300);
+    CHECK(ug_is_locked(&state, now));
+
+    now += 30 * 60 - 300;
+    events = ug_tick(&state, now, 1, 1);
+    CHECK(events == UGEventBreakEnded);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+    CHECK(!ug_is_locked(&state, now));
+
+    /* A second full loop still works. */
+    events = advance(&state, &now, 20 * 60, 1, 1) |
+             advance(&state, &now, 30 * 60, 0, 0);
+    CHECK((events & UGEventBreakBegan) != 0);
+    CHECK((events & UGEventBreakEnded) != 0);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+}
+
+static void test_usage_gating(void)
+{
+    UGState state;
+    long long now = 2000000;
+
+    ug_state_defaults(&state, now);
+
+    advance(&state, &now, 300, 0, 1); /* screen off */
+    CHECK(state.remaining == 20 * 60);
+    CHECK(state.lastWall == now);
+
+    advance(&state, &now, 300, 1, 0); /* locked */
+    CHECK(state.remaining == 20 * 60);
+    CHECK(state.lastWall == now);
+
+    advance(&state, &now, 300, 0, 0); /* screen off and locked */
+    CHECK(state.remaining == 20 * 60);
+
+    ug_set_enabled(&state, 0, now);
+    advance(&state, &now, 300, 1, 1); /* tweak disabled */
+    CHECK(state.remaining == 20 * 60);
+    CHECK(state.lastWall == now);
+
+    ug_set_enabled(&state, 1, now);
+    advance(&state, &now, 10, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 10);
+}
+
+static void test_override_pause_resume(void)
+{
+    UGState state;
+    UGState breaking;
+    long long now = 3000000;
+    int events;
+
+    ug_state_defaults(&state, now);
+    advance(&state, &now, 100, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 100);
+
+    ug_pause(&state, now, 15);
+    CHECK(ug_is_overridden(&state, now));
+    CHECK(ug_override_remaining(&state, now) == 15 * 60);
+
+    events = advance(&state, &now, 60, 1, 1);
+    CHECK(events == UGEventNone);
+    CHECK(state.remaining == 20 * 60 - 100); /* frozen while overridden */
+    CHECK(ug_override_remaining(&state, now) == 14 * 60);
+
+    events = advance(&state, &now, 14 * 60, 1, 1);
+    CHECK(events == UGEventOverrideEnded);
+    CHECK(!ug_is_overridden(&state, now));
+    CHECK(state.remaining == 20 * 60 - 100); /* resumes exactly where paused */
+
+    advance(&state, &now, 10, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 110);
+
+    /* Override also hides a running break and freezes its countdown. */
+    ug_state_defaults(&breaking, now);
+    ug_start_break(&breaking, now);
+    CHECK(ug_is_locked(&breaking, now));
+    ug_pause(&breaking, now, 30);
+    CHECK(!ug_is_locked(&breaking, now));
+    CHECK(ug_override_remaining(&breaking, now) == 30 * 60);
+    advance(&breaking, &now, 30 * 60, 0, 0);
+    /* The shared clock advanced past the override; the break must still be
+     * at its full duration because nothing was consumed while paused. */
+    CHECK(breaking.remaining == 30 * 60);
+    CHECK(ug_is_locked(&breaking, now));
+}
+
+static void test_reset_and_start_break(void)
+{
+    UGState state;
+    long long now = 4000000;
+
+    ug_state_defaults(&state, now);
+    advance(&state, &now, 500, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 500);
+
+    ug_reset(&state, now);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+    CHECK(state.overrideUntil == 0);
+    CHECK(!ug_is_locked(&state, now));
+
+    ug_start_break(&state, now);
+    CHECK(state.phase == UGPhaseBreak);
+    CHECK(state.remaining == 30 * 60);
+    CHECK(ug_is_locked(&state, now));
+
+    ug_reset(&state, now);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+    CHECK(!ug_is_locked(&state, now));
+}
+
+static void test_clock_jumps(void)
+{
+    UGState state;
+    long long now = 5000000;
+    long long jumped;
+
+    ug_state_defaults(&state, now);
+
+    jumped = now + 100000;
+    ug_tick(&state, jumped, 1, 1);
+    CHECK(state.remaining == 20 * 60 - UG_MAX_CREDIT_SECONDS);
+    now = jumped;
+
+    now += 1;
+    ug_tick(&state, now, 1, 1);
+    CHECK(state.remaining == 20 * 60 - UG_MAX_CREDIT_SECONDS - 1);
+
+    /* Clock stepped backwards: nothing is credited and time restarts now. */
+    now -= 5000;
+    ug_tick(&state, now, 1, 1);
+    CHECK(state.remaining == 20 * 60 - UG_MAX_CREDIT_SECONDS - 1);
+    CHECK(state.lastWall == now);
+
+    advance(&state, &now, 10, 1, 1);
+    CHECK(state.remaining == 20 * 60 - UG_MAX_CREDIT_SECONDS - 11);
+
+    /* A huge forward jump during a break ends it without overflowing. */
+    ug_start_break(&state, now);
+    jumped = now + 999999;
+    ug_tick(&state, jumped, 1, 1);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+    now = jumped;
+    ug_tick(&state, now + 1, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 1);
+}
+
+static void test_startup_restore(void)
+{
+    UGState state;
+    long long now = 6000000;
+
+    /* Interrupted usage phase: downtime is not credited. */
+    ug_state_defaults(&state, now);
+    state.remaining = 600;
+    state.lastWall = now - 3600;
+    ug_state_startup(&state, now);
+    ug_tick(&state, now, 1, 1);
+    CHECK(state.remaining == 600);
+    CHECK(state.lastWall == now);
+
+    /* Interrupted break: real elapsed time is applied. */
+    ug_state_defaults(&state, now);
+    state.phase = UGPhaseBreak;
+    state.remaining = 30 * 60;
+    state.lastWall = now - 3600;
+    ug_state_startup(&state, now);
+    ug_tick(&state, now, 0, 0);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+
+    /* Partially elapsed break keeps the remainder left at the last tick. */
+    ug_state_defaults(&state, now);
+    state.phase = UGPhaseBreak;
+    state.remaining = 1800;
+    state.lastWall = now - 600;
+    ug_state_startup(&state, now);
+    ug_tick(&state, now, 0, 0);
+    CHECK(state.phase == UGPhaseBreak);
+    CHECK(state.remaining == 1200);
+}
+
+static void test_serialization_round_trip(void)
+{
+    UGState original;
+    UGState restored;
+    char buffer[UG_STATE_BUFFER_SIZE];
+    char small[8];
+    size_t length;
+
+    memset(&original, 0, sizeof original);
+    ug_state_defaults(&original, 7000000);
+    original.phase = UGPhaseBreak;
+    original.usageMinutes = 25;
+    original.breakMinutes = 45;
+    original.remaining = 777;
+    original.lastWall = 7000123;
+    original.overrideUntil = 7000999;
+
+    length = ug_serialize(&original, buffer, sizeof buffer);
+    CHECK(length > 0);
+    CHECK(length < UG_STATE_BUFFER_SIZE);
+    CHECK(strlen(buffer) == length);
+    CHECK(strstr(buffer, "v=1;") == buffer);
+
+    memset(&restored, 0, sizeof restored);
+    CHECK(ug_deserialize(&restored, buffer, 7000500) == 1);
+    CHECK(restored.enabled == original.enabled);
+    CHECK(restored.phase == original.phase);
+    CHECK(restored.usageMinutes == original.usageMinutes);
+    CHECK(restored.breakMinutes == original.breakMinutes);
+    CHECK(restored.remaining == original.remaining);
+    CHECK(restored.lastWall == original.lastWall);
+    CHECK(restored.overrideUntil == original.overrideUntil);
+
+    /* Same bytes again: serialization is deterministic. */
+    {
+        char again[UG_STATE_BUFFER_SIZE];
+        CHECK(ug_serialize(&restored, again, sizeof again) == length);
+        CHECK(memcmp(buffer, again, length) == 0);
+    }
+
+    /* Buffer accounting and corrupt input. */
+    CHECK(ug_serialize(&original, small, sizeof small) == 0);
+    CHECK(small[0] == '\0');
+    CHECK(ug_serialize(&original, buffer, 0) == 0);
+    CHECK(ug_serialize(NULL, buffer, sizeof buffer) == 0);
+
+    ug_state_defaults(&restored, 8000000);
+    CHECK(ug_deserialize(&restored, "", 8000000) == 0);
+    CHECK(ug_deserialize(&restored, "garbage", 8000000) == 0);
+    CHECK(ug_deserialize(&restored, "enabled=1;phase=0;", 8000000) == 0);
+    CHECK(ug_deserialize(&restored, "v=2;enabled=1;", 8000000) == 0);
+    CHECK(ug_deserialize(&restored, "v=1;phase=9;", 8000000) == 0);
+    CHECK(ug_deserialize(&restored, "v=1;enabled=0;phase=1;usage=20;brk=30;", 8000000) == 1);
+    CHECK(restored.enabled == 0);
+    CHECK(restored.phase == UGPhaseBreak);
+    CHECK(restored.remaining == 20 * 60); /* clamped to the break allowance */
+
+    /* Unknown keys (including non-numeric ones) are skipped. */
+    ug_state_defaults(&restored, 9000000);
+    restored.usageMinutes = 33;
+    CHECK(ug_deserialize(&restored, "v=1;future=hello;enabled=1;", 9000000) == 1);
+    CHECK(restored.usageMinutes == 33);
+    CHECK(restored.enabled == 1);
+
+    /* Missing keys keep the caller's existing values. */
+    ug_state_defaults(&restored, 9000000);
+    restored.usageMinutes = 33;
+    CHECK(ug_deserialize(&restored, "v=1;enabled=1;", 9000000) == 1);
+    CHECK(restored.usageMinutes == 33);
+    CHECK(restored.breakMinutes == 30);
+
+    /* Out-of-range values are clamped, never trusted. */
+    CHECK(ug_deserialize(&restored, "v=1;usage=0;brk=9999;", 9000000) == 1);
+    CHECK(restored.usageMinutes == UG_MIN_MINUTES);
+    CHECK(restored.breakMinutes == UG_MAX_MINUTES);
+}
+
+static void test_duration_changes(void)
+{
+    UGState state;
+    long long now = 9100000;
+    int events;
+
+    ug_state_defaults(&state, now);
+    CHECK(state.remaining == 1200);
+    ug_set_usage_minutes(&state, 10);
+    CHECK(state.remaining == 600);
+    ug_set_usage_minutes(&state, 30);
+    CHECK(state.remaining == 600); /* raising the limit does not re-credit */
+    CHECK(state.usageMinutes == 30);
+
+    ug_set_usage_minutes(&state, 0);
+    CHECK(state.usageMinutes == UG_MIN_MINUTES);
+    CHECK(state.remaining == 60); /* clamped to the new one-minute allowance */
+    ug_set_usage_minutes(&state, 1000);
+    CHECK(state.usageMinutes == UG_MAX_MINUTES);
+    ug_set_usage_minutes(&state, 20);
+    CHECK(state.usageMinutes == 20);
+
+    ug_start_break(&state, now);
+    CHECK(state.remaining == 30 * 60);
+    ug_set_break_minutes(&state, 25);
+    CHECK(state.remaining == 25 * 60);
+    ug_set_break_minutes(&state, 60);
+    CHECK(state.remaining == 25 * 60);
+    CHECK(state.breakMinutes == 60);
+
+    /* The next break uses the configured (not the previous) duration. */
+    now += 25 * 60;
+    events = ug_tick(&state, now, 1, 1);
+    CHECK(events == UGEventBreakEnded);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60);
+
+    events = advance(&state, &now, 20 * 60, 1, 1);
+    CHECK(events == UGEventBreakBegan);
+    CHECK(state.remaining == 60 * 60);
+}
+
+static void test_disabled_break_freeze(void)
+{
+    UGState state;
+    long long now = 9200000;
+
+    ug_state_defaults(&state, now);
+    ug_start_break(&state, now);
+    ug_set_enabled(&state, 0, now);
+    CHECK(!ug_is_locked(&state, now));
+
+    advance(&state, &now, 100, 1, 1);
+    CHECK(state.remaining == 30 * 60); /* break frozen while disabled */
+    CHECK(!ug_is_locked(&state, now));
+
+    ug_set_enabled(&state, 1, now);
+    advance(&state, &now, 10, 1, 1);
+    CHECK(state.remaining == 30 * 60 - 10);
+    CHECK(ug_is_locked(&state, now));
+}
+
+static void test_override_and_resume_helpers(void)
+{
+    UGState state;
+    long long now = 9300000;
+
+    ug_state_defaults(&state, now);
+    CHECK(!ug_is_overridden(&state, now));
+    CHECK(ug_override_remaining(&state, now) == 0);
+
+    ug_pause(&state, now, 1);
+    CHECK(ug_override_remaining(&state, now) == 60);
+    CHECK(ug_is_overridden(&state, now));
+
+    now += 30;
+    ug_resume(&state, now);
+    CHECK(!ug_is_overridden(&state, now));
+    CHECK(ug_override_remaining(&state, now) == 0);
+
+    advance(&state, &now, 5, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 5);
+}
+
+static void test_mmss_formatting(void)
+{
+    char buffer[16];
+    char small[4];
+
+    CHECK(ug_format_mmss(0, buffer, sizeof buffer) == 5);
+    CHECK(strcmp(buffer, "00:00") == 0);
+    CHECK(ug_format_mmss(59, buffer, sizeof buffer) == 5);
+    CHECK(strcmp(buffer, "00:59") == 0);
+    CHECK(ug_format_mmss(60, buffer, sizeof buffer) == 5);
+    CHECK(strcmp(buffer, "01:00") == 0);
+    CHECK(ug_format_mmss(1200, buffer, sizeof buffer) == 5);
+    CHECK(strcmp(buffer, "20:00") == 0);
+    CHECK(ug_format_mmss(3599, buffer, sizeof buffer) == 5);
+    CHECK(strcmp(buffer, "59:59") == 0);
+    CHECK(ug_format_mmss(14400, buffer, sizeof buffer) == 6);
+    CHECK(strcmp(buffer, "240:00") == 0);
+    CHECK(ug_format_mmss(-5, buffer, sizeof buffer) == 5);
+    CHECK(strcmp(buffer, "00:00") == 0);
+    CHECK(ug_format_mmss(1200, small, sizeof small) == 0);
+    CHECK(small[0] == '\0');
+    CHECK(ug_format_mmss(1200, buffer, 0) == 0);
+}
+
+int main(void)
+{
+    test_full_cycle_wrap();
+    test_usage_gating();
+    test_override_pause_resume();
+    test_reset_and_start_break();
+    test_clock_jumps();
+    test_startup_restore();
+    test_serialization_round_trip();
+    test_duration_changes();
+    test_disabled_break_freeze();
+    test_override_and_resume_helpers();
+    test_mmss_formatting();
+
+    if (failures != 0) {
+        fprintf(stderr, "%d check(s) failed\n", failures);
+        return 1;
+    }
+    printf("all core checks passed\n");
+    return 0;
+}

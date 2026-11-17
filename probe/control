@@ -1,0 +1,9 @@
+Package: org.usageguard.probe
+Name: Usage Guard Probe
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: Minimal, recoverable SpringBoard smoke test for the Usage Guard build.
+Maintainer: Usage Guard
+Author: Usage Guard
+Section: Tweaks
+Depends: mobilesubstrate
