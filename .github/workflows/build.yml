@@ -68,11 +68,11 @@ jobs:
           # Theos' fakeroot shim picks the sysv backend; tcp can hang on runners.
           sudo update-alternatives --set fakeroot /usr/bin/fakeroot-sysv
           echo "--- host tool versions ---"
-          make --version | head -n1
+          make --version | awk 'NR==1'
           perl -v | sed -n '2p'
-          dpkg-deb --version | head -n1
-          unzip -v | head -n1
-          xz --version | head -n1
+          dpkg-deb --version | awk 'NR==1'
+          unzip -v | awk 'NR==1'
+          xz --version | awk 'NR==1'
           git --version
           python3 --version
 
