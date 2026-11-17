@@ -251,11 +251,11 @@ static BOOL UGLockScreenManagerLocked(BOOL *locked)
     return YES;
 }
 
-static BOOL UGNotificationStateValue(const char *name, int *token, BOOL *value)
+static BOOL UGNotificationStateValue(NSString *name, int *token, BOOL *value)
 {
     uint64_t state = 0;
 
-    if (*token < 0 && notify_register_check(name, token) != NOTIFY_STATUS_OK) {
+    if (*token < 0 && notify_register_check([name UTF8String], token) != NOTIFY_STATUS_OK) {
         *token = -1;
         return NO;
     }
