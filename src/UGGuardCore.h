@@ -14,8 +14,9 @@
 #define UG_STATE_BUFFER_SIZE 512
 
 /* Largest wall-clock delta ever credited to usage in one tick. Ticks run at
- * 1 Hz, so this only matters after a clock jump. */
-#define UG_MAX_CREDIT_SECONDS 60
+ * 1 Hz, so a value of 2 covers a slightly late timer while never handing out a
+ * free minute after the phone wakes from sleep. */
+#define UG_MAX_CREDIT_SECONDS 2
 
 #define UG_DEFAULT_USAGE_MINUTES 20
 #define UG_DEFAULT_BREAK_MINUTES 30

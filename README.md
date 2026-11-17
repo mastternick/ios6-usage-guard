@@ -106,10 +106,36 @@ tests/run.sh            host test runner
 same file builds on a desktop compiler and inside the tweak. The cycle engine
 uses no allocation and its serialized state is bounded well below 512 bytes.
 
-## Build
+## Build — GitHub Actions (no local toolchain)
 
-Requires a working Theos installation with the iPhoneOS 6.1 SDK, and clang with
-`ldid` available (standard Theos setup).
+The supported path is the CI pipeline in `.github/workflows/build.yml`. It runs
+on every push to `main` and on manual `workflow_dispatch`, installs Theos with
+the iPhoneOS 6.1 SDK and a 32-bit-capable LLVM toolchain on a GitHub-hosted
+Ubuntu runner, builds the probe tweak first, then this tweak, statically
+validates both packages, and uploads:
+
+| artifact | contents |
+| --- | --- |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.0_iphoneos-arm.deb` — install this |
+| `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
+| `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
+
+Download the `.deb` from the run's *Artifacts* section on GitHub, or from a
+checkout with the GitHub CLI:
+
+```sh
+gh run download --name usage-guard-deb
+```
+
+Validation is enforced, not advisory: the pipeline fails unless the payload is
+a single-slice **armv7** `MH_DYLIB` with `LC_VERSION_MIN_IPHONEOS 6.0.0` and a
+code signature, `Architecture: iphoneos-arm`, `Depends:` containing
+`mobilesubstrate`, and exactly the dylib plus its filter plist under
+`Library/MobileSubstrate/DynamicLibraries/` naming `com.apple.springboard`.
+
+### Local build (optional, requires your own toolchain)
+
+With a working Theos installation, the iPhoneOS 6.1 SDK and `ldid` on PATH:
 
 ```sh
 make package FINALPACKAGE=1

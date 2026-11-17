@@ -12,6 +12,9 @@ name: build
 on:
   push:
     branches: [main]
+    # Tag pushes run the same build+validate, then publish the validated debs
+    # as a GitHub Release (see the tag-gated step at the end of the job).
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       theos_ref:
@@ -22,9 +25,6 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
 
 env:
   # Keep Theos outside the checkout: every project stages into <project>/.theos,
@@ -48,8 +48,13 @@ env:
 jobs:
   build:
     name: armv7 iOS 6.1 cross-build
-    # Pinned: the dep list, fakeroot alternative and prebuilt toolchain all
-    # assume Ubuntu 22.04.
+    # Requested for the tag-gated release step (softprops/action-gh-release).
+    # Every other step only reads the checkout; scopes not listed here are none.
+    permissions:
+      contents: write
+    # Pinned: the prebuilt LLVM toolchain links against glibc 2.38, which
+    # Ubuntu 22.04 (glibc 2.35) does not provide. Keep this in sync with
+    # RUNNER_IMAGE above, which only feeds the cache keys.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -295,7 +300,8 @@ jobs:
           sha256sum "$deb" | tee -a "$log"
           python3 scripts/validate_deb.py "$deb" \
             --expect-package org.usageguard.probe \
-            --expect-base UsageGuardProbe | tee -a "$log"
+            --expect-base UsageGuardProbe \
+            | tee -a "$log" | tee "$GITHUB_WORKSPACE/build-logs/probe-validation.txt"
 
       - name: Build + validate Usage Guard package
         run: |
@@ -327,7 +333,8 @@ jobs:
           deb="$(ls -1t packages/*.deb | head -n1)"
           echo "built: $deb ($(stat -c%s "$deb") bytes)"
           sha256sum "$deb" | tee -a "$log"
-          python3 scripts/validate_deb.py "$deb" --forbid-package org.usageguard.probe | tee -a "$log"
+          python3 scripts/validate_deb.py "$deb" --forbid-package org.usageguard.probe \
+            | tee -a "$log" | tee "$GITHUB_WORKSPACE/build-logs/usage-guard-validation.txt"
 
       # Real package first: it is the deliverable. Failures never upload a
       # half-built artifact; only logs are uploaded unconditionally.
@@ -348,6 +355,143 @@ jobs:
           path: probe/packages/*.deb
           if-no-files-found: error
           retention-days: 30
+
+      # Tag pushes (v*) additionally publish the already-validated packages as a
+      # GitHub Release. Branch/workflow_dispatch runs stop after the artifact
+      # uploads above; no validation gate is relaxed and nothing is rebuilt.
+      - name: Compose release notes (tag builds only)
+        if: success() && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, hashlib, os
+
+          root = os.environ.get("GITHUB_WORKSPACE", ".")
+          tag = os.environ["GITHUB_REF_NAME"]
+          run_url = "%s/%s/actions/runs/%s" % (
+              os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
+              os.environ["GITHUB_REPOSITORY"],
+              os.environ["GITHUB_RUN_ID"],
+          )
+
+
+          def newest(pattern):
+              matches = [p for p in glob.glob(os.path.join(root, pattern)) if os.path.isfile(p)]
+              if not matches:
+                  raise SystemExit("no file matched %r; nothing to publish" % pattern)
+              return max(matches, key=os.path.getmtime)
+
+
+          def digest(path):
+              sha = hashlib.sha256()
+              with open(path, "rb") as handle:
+                  for chunk in iter(lambda: handle.read(1 << 20), b""):
+                      sha.update(chunk)
+              return sha.hexdigest()
+
+
+          def summary(rel):
+              path = os.path.join(root, rel)
+              if not os.path.isfile(path):
+                  raise SystemExit("missing validation summary %s" % rel)
+              return open(path).read().strip()
+
+
+          main_deb = newest("packages/org.usageguard.timer_*_iphoneos-arm.deb")
+          probe_deb = newest("probe/packages/org.usageguard.probe_*_iphoneos-arm.deb")
+          main_name = os.path.basename(main_deb)
+          probe_name = os.path.basename(probe_deb)
+
+          lines = [
+              "## Usage Guard %s" % tag,
+              "",
+              "**armv7 (32-bit) · iOS 6.0+ · rootful** — for jailbroken iOS 6 devices",
+              "(iPhone 4S, iPad 2/3, iPod touch 5) with Cydia Substrate installed.",
+              "",
+              "- package id: `org.usageguard.timer`",
+              "- architecture: armv7 only; deployment target iOS 6.0; rootful layout",
+              "- built and statically validated by CI: %s" % run_url,
+              "",
+              "### Install",
+              "",
+              "```sh",
+              "scp %s root@<device-ip>:/var/root/" % main_name,
+              "ssh root@<device-ip> \"dpkg -i /var/root/%s && killall -9 SpringBoard\"" % main_name,
+              "```",
+              "",
+              "Copying the .deb to the device with iFile/Filza and installing it also works.",
+              "",
+              "### Uninstall",
+              "",
+              "```sh",
+              "dpkg -r org.usageguard.timer",
+              "```",
+              "",
+              "### Assets",
+              "",
+              "| file | sha256 | contents |",
+              "| --- | --- | --- |",
+              "| `%s` | `%s` | Usage Guard tweak |" % (main_name, digest(main_deb)),
+              "| `%s` | `%s` | optional smoke-test probe |" % (probe_name, digest(probe_deb)),
+              "",
+              "`%s` only proves that injection works: it hooks SpringBoard's" % probe_name,
+              "`applicationDidFinishLaunching:`, shows a 3 second non-interactive label and logs",
+              "once. It writes nothing and stores nothing.",
+              "",
+              "```sh",
+              "dpkg -i %s" % probe_name,
+              "dpkg -r org.usageguard.probe",
+              "touch /var/mobile/Library/Preferences/org.usageguard.probe.disable  # disable without uninstalling",
+              "```",
+              "",
+              "### Validation",
+              "",
+              "Both packages were checked by `scripts/validate_deb.py`: thin armv7 Mach-O",
+              "(cputype 12 / subtype 9), `LC_VERSION_MIN_IPHONEOS` 6.0.0, `LC_CODE_SIGNATURE`,",
+              "`Architecture: iphoneos-arm`, `Depends: mobilesubstrate`, and exactly the dylib",
+              "plus filter plist under `Library/MobileSubstrate/DynamicLibraries/`.",
+              "",
+              "<details><summary>Usage Guard — %s</summary>" % main_name,
+              "",
+              "```",
+              summary("build-logs/usage-guard-validation.txt"),
+              "```",
+              "",
+              "</details>",
+              "",
+              "<details><summary>Probe — %s</summary>" % probe_name,
+              "",
+              "```",
+              summary("build-logs/probe-validation.txt"),
+              "```",
+              "",
+              "</details>",
+              "",
+          ]
+
+          out = os.path.join(root, "build-logs", "release-notes.md")
+          with open(out, "w") as handle:
+              handle.write("\n".join(lines))
+          print("wrote %s (%d bytes)" % (out, os.path.getsize(out)))
+          PY
+          echo "--- release-notes.md ---"
+          cat build-logs/release-notes.md
+
+      - name: Publish GitHub release (tag builds only)
+        if: success() && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Usage Guard ${{ github.ref_name }}
+          body_path: build-logs/release-notes.md
+          draft: false
+          prerelease: false
+          preserve_order: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            packages/org.usageguard.timer_*_iphoneos-arm.deb
+            probe/packages/org.usageguard.probe_*_iphoneos-arm.deb
 
       - name: Upload build logs
         if: always()
