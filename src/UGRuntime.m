@@ -675,12 +675,12 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     /* 3. Last resort on iOS 6: the notify(3) *state* of the same notifications
      *    says whether the phone is locked or the screen is blanked. */
     if (!unlockKnown &&
-        UGNotificationStateValue(kUGNotifyLockState, &sUGLockStateToken, &value)) {
+        UGNotificationStateValue(kUGNotificationLockState, &sUGLockStateToken, &value)) {
         _unlocked = !value;
         unlockKnown = YES;
     }
     if (!screenKnown &&
-        UGNotificationStateValue(kUGNotifyBlankedScreen, &sUGBlankedToken, &value)) {
+        UGNotificationStateValue(kUGNotificationScreenBlanked, &sUGBlankedToken, &value)) {
         _screenOn = !value;
         screenKnown = YES;
     }
