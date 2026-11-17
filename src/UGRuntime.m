@@ -16,9 +16,8 @@ static NSString *const kUGNotificationScreenBlanked = @"com.apple.springboard.ha
 static NSString *const kUGNotificationLockComplete = @"com.apple.springboard.lockcomplete";
 static NSString *const kUGNotificationLockState = @"com.apple.springboard.lockstate";
 
-/* Escape window for a real emergency call, and the upper bound while one runs. */
+/* Escape window while the dialer opens and no call ever starts. */
 static const long long kUGEmergencyNoCallSeconds = 15;
-static const long long kUGEmergencyCallSeconds = 120;
 
 /* At most one state write per minute unless something actually happened. */
 static const long long kUGPersistIntervalSeconds = 60;
@@ -454,7 +453,10 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     if (_savedStateString && [encoded isEqualToString:_savedStateString]) return;
 
     now = UGNowSeconds();
-    if (!forced && now - _lastPersistWall < kUGPersistIntervalSeconds) return;
+    /* Only rate limit while the clock is consistent: after a backward jump the
+     * gap is negative, and skipping then would permanently disable the saves. */
+    if (!forced && now >= _lastPersistWall &&
+        now - _lastPersistWall < kUGPersistIntervalSeconds) return;
 
     if ([_prefs saveState:&_state]) {
         _savedStateString = encoded;
@@ -491,8 +493,9 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
     now = UGNowSeconds();
     if (_callActive) {
+        /* A real call keeps the overlay away for its whole length; the window
+         * closes as soon as the call ends. */
         _emergencyCallSeen = YES;
-        _emergencyUntil = now + kUGEmergencyCallSeconds;
         return;
     }
 
@@ -504,10 +507,21 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
 - (void)syncUI
 {
-    long long now = UGNowSeconds();
-    BOOL emergency = _emergencyUntil > now;
-    BOOL locked = ug_is_locked(&_state, now) && _screenOn && _unlocked &&
-                  !emergency && !_callActive;
+    long long now;
+    BOOL emergency;
+    BOOL locked;
+
+    /* A refresh queued before the kill switch must not lock the home button
+     * while the tweak is inert: tick never runs then, so nothing would undo it. */
+    if (_inert) {
+        sUGOverlayLocked = 0;
+        return;
+    }
+
+    now = UGNowSeconds();
+    emergency = _emergencyUntil > now;
+    locked = ug_is_locked(&_state, now) && _screenOn && _unlocked &&
+             !emergency && !_callActive;
 
     sUGOverlayLocked = locked ? 1 : 0;
 

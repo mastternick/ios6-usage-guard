@@ -79,8 +79,9 @@ On startup:
 Clock rules on every tick:
 
 * backward jumps are ignored: the gap is not credited and time restarts from
-  "now", while a parent pause keeps only the time it had left, so winding the
-  clock back cannot extend it;
+  "now", while a parent pause keeps only the time it had left, measured from
+  the clock it was granted under, so winding the clock back and then respringing
+  or rebooting cannot extend it;
 * forward jumps and the first tick after sleep credit at most 2 seconds of usage,
   which is why usage only counts while the screen is on and unlocked.
 
@@ -190,8 +191,10 @@ A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'
 deb installer) works the same way. After installation the tweak starts with
 SpringBoard; there is no app icon and no settings bundle.
 
-To remove it: `dpkg -r org.usageguard.timer` (or `dpkg -P` to drop the
-preferences file) followed by a respring.
+To remove it: `dpkg -r org.usageguard.timer` (or `dpkg -P`) followed by a
+respring. The preferences file `org.usageguard.timelock.plist` lives in the
+preferences directory and is created at runtime, so the package removal leaves
+it in place; delete it by hand if a clean slate is wanted.
 
 ## Emergency recovery
 
@@ -245,8 +248,8 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
 * **Not a passcode replacement.** The tweak never touches Apple's lock state
   or passcode; a locked device shows the native lock screen.
 * **Emergency valve window.** While `tel:112` is opened the timeline stays
-  hidden only while the call lasts (at most 120 seconds) or for 15 seconds when
-  no call starts. If SpringBoard silently refuses to open the URL, the timeline
+  hidden for as long as the call lasts; if no call ever starts, it comes back
+  after 15 seconds. If SpringBoard silently refuses to open the URL, the timeline
   still returns after that window. If the dialer itself is unreachable, the
   button reports that emergency calling is unavailable inside the overlay.
 * **Calls always win.** While a call is active (incoming, outgoing or the
@@ -256,8 +259,11 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   ends.
 * **Clock trust.** The cycle uses wall-clock deltas with clamping as described
   above. A determined user changing the system clock can move the cycle
-  forward; backward jumps are ignored, forward usage credit is capped at 2
-  seconds per tick, and a parent pause keeps only the time it had left.
+  forward: a forward jump during a parent pause makes the pause look expired,
+  so the break it froze resumes at the pause's end time and the jump can end it
+  at once. Backward jumps are ignored, forward usage credit is capped at 2
+  seconds per tick, and a parent pause keeps only the time it had left,
+  including across a respring or reboot.
 * **Break while disabled.** Disabling the tweak freezes the cycle, including a
   running break; re-enabling resumes it.
 * **SpringBoard only.** Nothing is injected into individual apps; the overlay

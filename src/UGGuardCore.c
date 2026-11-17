@@ -37,6 +37,13 @@ void ug_state_defaults(UGState *state, long long now)
 void ug_state_startup(UGState *state, long long now)
 {
     if (!state) return;
+    /* A live pause must keep the time it had left when the clock went back,
+     * even across a reboot or a resume from inert mode: re-anchor it to the
+     * new clock before the usage phase forgets the old one. */
+    if (now < state->lastWall && state->overrideUntil > 0) {
+        long long left = state->overrideUntil - state->lastWall;
+        state->overrideUntil = left > 0 ? now + left : 0;
+    }
     /* A usage phase must not be credited for the time the tweak was down.
      * A break keeps its last tick so it elapses with real time. */
     if (state->phase == UGPhaseUsage) state->lastWall = now;
@@ -322,9 +329,11 @@ int ug_deserialize(UGState *state, const char *text, long long now)
     if (parsed.lastWall <= 0) parsed.lastWall = now;
     if (parsed.overrideUntil < 0) parsed.overrideUntil = 0;
     /* A persisted override can never outlive the longest pause a parent can
-     * grant, even if the file was written under a wrong clock. */
-    if (parsed.overrideUntil > now + (long long)UG_MAX_MINUTES * 60LL) {
-        parsed.overrideUntil = now + (long long)UG_MAX_MINUTES * 60LL;
+     * grant, measured from the clock the file was written under. Clamping
+     * against `now` would stretch the pause by however far the clock was
+     * wound back between the save and the load. */
+    if (parsed.overrideUntil > parsed.lastWall + (long long)UG_MAX_MINUTES * 60LL) {
+        parsed.overrideUntil = parsed.lastWall + (long long)UG_MAX_MINUTES * 60LL;
     }
 
     *state = parsed;

@@ -293,6 +293,81 @@ static void test_backward_clock_does_not_extend_override(void)
     CHECK(state.lastWall == now);
 }
 
+static void test_rollback_before_restart_keeps_pause(void)
+{
+    UGState paused;
+    UGState restored;
+    char buffer[UG_STATE_BUFFER_SIZE];
+    long long now = 1700000000;
+    long long back;
+    long long left;
+
+    /* Parent pauses during a usage phase with 15 minutes on the clock. */
+    ug_state_defaults(&paused, now);
+    paused.remaining = 20 * 60 - 100;
+    ug_pause(&paused, now, 15);
+    CHECK(ug_override_remaining(&paused, now) == 900);
+
+    /* The forced write lands before the child touches the clock. */
+    CHECK(ug_tick(&paused, now, 1, 1) == UGEventNone);
+    CHECK(ug_serialize(&paused, buffer, sizeof buffer) > 0);
+    CHECK(strstr(buffer, "ovr=1700000900;") != NULL);
+    CHECK(strstr(buffer, "last=1700000000;") != NULL);
+
+    /* The clock is wound back a year and the device reboots without locking
+     * first. The stale string is loaded, so the pause must keep the 900 s it
+     * had left instead of stretching to the 240-minute clamp. */
+    back = now - 365LL * 24 * 60 * 60;
+    ug_state_defaults(&restored, back);
+    CHECK(ug_deserialize(&restored, buffer, back) == 1);
+    CHECK(restored.overrideUntil == now + 900);
+
+    ug_state_startup(&restored, back);
+    left = ug_override_remaining(&restored, back);
+    CHECK(left == 900);
+    CHECK(left <= (long long)UG_MAX_MINUTES * 60LL);
+    CHECK(restored.remaining == 20 * 60 - 100);
+
+    /* The re-anchored pause still freezes usage, and only the pause elapses. */
+    CHECK(ug_is_overridden(&restored, back + 100));
+    CHECK(ug_tick(&restored, back + 100, 1, 1) == UGEventNone);
+    CHECK(restored.remaining == 20 * 60 - 100);
+    CHECK(!ug_is_locked(&restored, back + 100));
+
+    /* The startup re-anchor on its own: a stale in-memory lastWall must not
+     * turn the leftover pause into a year either. */
+    {
+        UGState stale;
+
+        ug_state_defaults(&stale, now);
+        stale.remaining = 20 * 60 - 100;
+        ug_pause(&stale, now, 15);
+        CHECK(ug_tick(&stale, now, 1, 1) == UGEventNone);
+        ug_state_startup(&stale, back);
+        CHECK(ug_override_remaining(&stale, back) == 900);
+        CHECK(stale.remaining == 20 * 60 - 100);
+    }
+}
+
+static void test_rollback_clamp_uses_saved_clock(void)
+{
+    UGState state;
+    long long now = 1700000000;
+    long long back = now - 365LL * 24 * 60 * 60;
+
+    /* The longest grant is capped relative to the clock the file was written
+     * under, never relative to the rolled-back clock that reads it. */
+    ug_state_defaults(&state, back);
+    CHECK(ug_deserialize(&state,
+                         "v=1;enabled=1;phase=0;usage=20;brk=30;rem=1100;"
+                         "last=1700000100;ovr=999999999999;",
+                         back) == 1);
+    CHECK(state.overrideUntil ==
+          1700000100 + (long long)UG_MAX_MINUTES * 60LL);
+    /* Measured from the writer's clock, not from the rolled-back `now`. */
+    CHECK(state.overrideUntil != now + (long long)UG_MAX_MINUTES * 60LL);
+}
+
 /* Regression: the 1 Hz timer stops while the phone sleeps; the first tick
  * after wake must not credit the whole sleep (or a free minute of it). */
 static void test_sleep_does_not_credit_usage(void)
@@ -546,6 +621,8 @@ int main(void)
     test_clock_jumps();
     test_override_expiry_keeps_real_time();
     test_backward_clock_does_not_extend_override();
+    test_rollback_before_restart_keeps_pause();
+    test_rollback_clamp_uses_saved_clock();
     test_sleep_does_not_credit_usage();
     test_startup_restore();
     test_serialization_round_trip();
