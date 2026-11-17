@@ -3,3 +3,6 @@ packages/
 *.deb
 build-logs/
 .DS_Store
+__pycache__/
+*.pyc
+.sdkchk/

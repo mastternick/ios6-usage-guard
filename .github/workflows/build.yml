@@ -130,7 +130,7 @@ jobs:
           tar -xJf "$tarball" -C "$THEOS/toolchain"
           test -x "$THEOS/toolchain/linux/iphone/bin/clang" || {
             echo "::error::toolchain extraction produced no clang at \$THEOS/toolchain/linux/iphone/bin/clang"
-            find "$THEOS/toolchain" -maxdepth 4 | head -n40
+            find "$THEOS/toolchain" -maxdepth 4 | awk 'NR<=40'
             exit 1
           }
 
@@ -170,9 +170,9 @@ jobs:
           echo "--- $THEOS/sdks ---"
           ls -la "$THEOS/sdks"
           echo "--- $SDK_NAME/System/Library/Frameworks (head) ---"
-          ls "$sdk/System/Library/Frameworks" | head -n20
+          ls "$sdk/System/Library/Frameworks" | awk 'NR<=20'
           echo "--- $SDK_NAME/usr/include (head) ---"
-          ls "$sdk/usr/include" | head -n20
+          ls "$sdk/usr/include" | awk 'NR<=20'
           missing=0
           for path in \
             System/Library/Frameworks/UIKit.framework/Headers/UIKit.h \
@@ -222,21 +222,21 @@ jobs:
           done
           if [ "${missing:-0}" -ne 0 ]; then
             echo "::error::the iOS toolchain at $tc is incomplete"
-            ls -la "$tc" | head -n40
+            ls -la "$tc" | awk 'NR<=40'
             exit 1
           fi
           echo "--- clang ---"
-          "$tc/clang" --version | head -n3
+          "$tc/clang" --version | awk 'NR<=3'
           echo "clang -dumpversion: $("$tc/clang" -dumpversion)"
           echo "--- cctools ld (ld64), required: the 6.1 SDK ships binary .dylib stubs, no .tbd ---"
           file "$tc/ld"
-          "$tc/ld" -version_details 2>&1 | head -n3 || true
+          "$tc/ld" -version_details 2>&1 | awk 'NR<=3' || true
           echo "--- ldid ---"
           file "$tc/ldid"
-          "$tc/ldid" -h 2>&1 | head -n1 || true
+          "$tc/ldid" -h 2>&1 | awk 'NR==1' || true
           echo "--- lipo / strip ---"
           file "$tc/lipo" "$tc/strip"
-          "$tc/lipo" -version 2>&1 | head -n1 || true
+          "$tc/lipo" -version 2>&1 | awk 'NR==1' || true
           echo "--- ldid -S + lipo smoke test on an armv7 slice of an SDK stub ---"
           tmp="$(mktemp -d)"
           "$tc/lipo" "$THEOS/sdks/$SDK_NAME/usr/lib/libobjc.A.dylib" -thin armv7 -output "$tmp/probe.dylib"
@@ -295,13 +295,25 @@ jobs:
             echo "::error::probe build produced no package in probe/packages"
             exit 1
           fi
-          deb="$(ls -1t probe/packages/*.deb | head -n1)"
+          deb="$(ls -1t probe/packages/*.deb | awk 'NR==1')"
           echo "built: $deb ($(stat -c%s "$deb") bytes)"
           sha256sum "$deb" | tee -a "$log"
           python3 scripts/validate_deb.py "$deb" \
             --expect-package org.usageguard.probe \
             --expect-base UsageGuardProbe \
             | tee -a "$log" | tee "$GITHUB_WORKSPACE/build-logs/probe-validation.txt"
+
+      # The probe is already built and validated at this point: publishing it
+      # now keeps the validated smoke-test deb in the run even if the full
+      # tweak compile below fails.
+      - name: Upload probe .deb
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: usage-guard-probe-deb
+          path: probe/packages/*.deb
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Build + validate Usage Guard package
         run: |
@@ -330,7 +342,7 @@ jobs:
             echo "::error::Usage Guard build produced no package in packages/"
             exit 1
           fi
-          deb="$(ls -1t packages/*.deb | head -n1)"
+          deb="$(ls -1t packages/*.deb | awk 'NR==1')"
           echo "built: $deb ($(stat -c%s "$deb") bytes)"
           sha256sum "$deb" | tee -a "$log"
           python3 scripts/validate_deb.py "$deb" --forbid-package org.usageguard.probe \
@@ -344,15 +356,6 @@ jobs:
         with:
           name: usage-guard-deb
           path: packages/*.deb
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload probe .deb
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: usage-guard-probe-deb
-          path: probe/packages/*.deb
           if-no-files-found: error
           retention-days: 30
 

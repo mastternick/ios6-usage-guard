@@ -82,8 +82,12 @@ Clock rules on every tick:
   "now", while a parent pause keeps only the time it had left, measured from
   the clock it was granted under, so winding the clock back and then respringing
   or rebooting cannot extend it;
-* forward jumps and the first tick after sleep credit at most 2 seconds of usage,
-  which is why usage only counts while the screen is on and unlocked.
+* forward jumps credit at most 2 seconds of usage per tick, which bounds what
+  a single awake gap can spend;
+* the first tick after the device becomes usable again (screen on and unlocked)
+  credits nothing: the usage clock is re-anchored on that transition, so
+  unlocking the phone never hands out the 2-second cap for time the phone was
+  not in use. Usage therefore only counts while the screen is on and unlocked.
 
 ## Safety valve
 
@@ -92,7 +96,9 @@ timeline and opens `tel:112` through SpringBoard, so a real emergency call can
 be placed even though every other interaction is blocked. The window stays open
 only while a call is active and closes as soon as the call ends; if no call ever
 starts it closes after 15 seconds. The overlay then returns by itself while the
-break is still running. If the URL cannot be opened, the
+break is still running. Only the window steps aside: the home-button/Siri
+suppression stays armed for the whole emergency window, so the valve cannot be
+used to get free SpringBoard access. If the URL cannot be opened, the
 overlay reports `Apelul de urgență nu este disponibil pe acest dispozitiv.` in
 its subtitle instead of behind it. Blocking power, volume, lock or telephony is
 never attempted.
@@ -131,7 +137,7 @@ validates both packages, and uploads:
 
 | artifact | contents |
 | --- | --- |
-| `usage-guard-deb` | `org.usageguard.timer_1.0.0_iphoneos-arm.deb` — install this |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.1_iphoneos-arm.deb` — install this |
 | `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
 | `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
 
@@ -157,7 +163,7 @@ make package FINALPACKAGE=1
 ```
 
 The package is written to `packages/` as
-`org.usageguard.timer_1.0.0_iphoneos-arm.deb`. The tweak targets
+`org.usageguard.timer_1.0.1_iphoneos-arm.deb`. The tweak targets
 `iphone:clang:6.1:6.0`, `ARCHS = armv7` (iPhone 4S / iPad 2 class hardware).
 
 ### Host tests (no Theos, no device)
@@ -172,7 +178,8 @@ or simply `tests/run.sh`. The tests cover full cycle wrap-around, usage gating
 (screen off, locked, disabled), break elapse across a wall-clock gap, break
 expiry resetting the allowance, parent pauses without drift, pause expiry that
 still ends an expired break on time, backward clock jumps that cannot extend a
-pause, the capped credit on the first tick after sleep, reset and start-break,
+pause, the capped credit on a long awake gap, no free credit on the first tick
+after reactivation, reset and start-break,
 serialization round-trip (including override clamping), duration validation and
 `MM:SS` formatting.
 
@@ -182,9 +189,9 @@ Copy the built `.deb` to the device and install it with dpkg, then respring or
 restart SpringBoard:
 
 ```sh
-scp packages/org.usageguard.timer_1.0.0_iphoneos-arm.deb root@DEVICE_IP:/var/root/
+scp packages/org.usageguard.timer_1.0.1_iphoneos-arm.deb root@DEVICE_IP:/var/root/
 ssh root@DEVICE_IP \
-  'dpkg -i /var/root/org.usageguard.timer_1.0.0_iphoneos-arm.deb && killall -9 SpringBoard'
+  'dpkg -i /var/root/org.usageguard.timer_1.0.1_iphoneos-arm.deb && killall -9 SpringBoard'
 ```
 
 A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'

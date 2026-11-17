@@ -59,6 +59,13 @@ void ug_state_startup(UGState *state, long long now);
  * mask of UGEvent bits. */
 int ug_tick(UGState *state, long long now, int screenOn, int unlocked);
 
+/* Inactive -> active transition: moves the usage-phase anchor to `now` without
+ * crediting the inactive gap. Call it when the device becomes usable again
+ * (screen off or locked to screen on and unlocked) so the next tick cannot
+ * spend the per-tick credit cap on time the child was not using the phone.
+ * A break keeps its anchor: it elapses in real time regardless. */
+void ug_rebase_last_wall(UGState *state, long long now);
+
 /* True when the overlay must be visible. */
 int ug_is_locked(const UGState *state, long long now);
 int ug_is_overridden(const UGState *state, long long now);

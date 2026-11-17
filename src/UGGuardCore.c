@@ -116,6 +116,14 @@ int ug_tick(UGState *state, long long now, int screenOn, int unlocked)
     return events;
 }
 
+void ug_rebase_last_wall(UGState *state, long long now)
+{
+    if (!state) return;
+    /* Usage-only: the inactive gap is deliberately not credited, so the child
+     * gets no free seconds just for unlocking the device. */
+    if (state->phase == UGPhaseUsage) state->lastWall = now;
+}
+
 int ug_is_locked(const UGState *state, long long now)
 {
     if (!state) return 0;

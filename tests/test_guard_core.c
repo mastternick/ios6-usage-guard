@@ -388,6 +388,55 @@ static void test_sleep_does_not_credit_usage(void)
     CHECK(state.remaining == 20 * 60 - 100 - 4);
 }
 
+/* Regression: unlocking the phone must not donate the per-tick credit cap.
+ * The timer does not run while the device sleeps, so the first awake tick used
+ * to spend up to UG_MAX_CREDIT_SECONDS of the inactive gap as usage. */
+static void test_reactivation_credits_no_free_usage(void)
+{
+    UGState state;
+    long long now = 9400000;
+
+    /* Locked-but-awake gap: 1 Hz inactive ticks credit nothing, then the
+     * reactivation re-anchor must leave exactly the following second to count. */
+    ug_state_defaults(&state, now);
+    state.remaining = 1200;
+    advance(&state, &now, 3600, 0, 0);
+    CHECK(state.remaining == 1200);
+
+    ug_rebase_last_wall(&state, now);
+    CHECK(state.lastWall == now);
+
+    now += 1;
+    CHECK(ug_tick(&state, now, 1, 1) == UGEventNone);
+    CHECK(state.remaining == 1199); /* exactly 1 s, not 2 or 3 */
+
+    /* Sleep gap: no ticks ran at all. The re-anchor applied on reactivation
+     * still leaves the first awake second to cost exactly one second. */
+    ug_state_defaults(&state, 9500000);
+    state.remaining = 1200;
+    now = 9503600;
+    ug_rebase_last_wall(&state, now);
+    now += 1;
+    CHECK(ug_tick(&state, now, 1, 1) == UGEventNone);
+    CHECK(state.remaining == 1199);
+
+    /* Without the re-anchor the same reactivation hands out the credit cap:
+     * that donation is exactly what the helper removes. */
+    ug_state_defaults(&state, 9600000);
+    state.remaining = 1200;
+    now = 9603600; /* woke up, no tick while asleep */
+    now += 1;
+    ug_tick(&state, now, 1, 1);
+    CHECK(state.remaining == 1200 - UG_MAX_CREDIT_SECONDS);
+
+    /* A break elapses in real time, so the re-anchor must not touch it. */
+    ug_state_defaults(&state, 9700000);
+    ug_start_break(&state, 9700000);
+    ug_rebase_last_wall(&state, 9700010);
+    CHECK(state.lastWall == 9700000);
+    CHECK(state.remaining == 30 * 60);
+}
+
 static void test_startup_restore(void)
 {
     UGState state;
@@ -624,6 +673,7 @@ int main(void)
     test_rollback_before_restart_keeps_pause();
     test_rollback_clamp_uses_saved_clock();
     test_sleep_does_not_credit_usage();
+    test_reactivation_credits_no_free_usage();
     test_startup_restore();
     test_serialization_round_trip();
     test_duration_changes();

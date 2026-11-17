@@ -419,6 +419,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     [self refreshDeviceState];
     [self refreshCallActive];
     [self updateEmergencyState];
+    [self rebaseClockIfBecameActive:(wasScreenOn && wasUnlocked)];
 
     now = UGNowSeconds();
     events = ug_tick(&_state, now, _screenOn ? 1 : 0, _unlocked ? 1 : 0);
@@ -433,6 +434,20 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     if (_needsFirstRunWizard && !_panelPresented && _screenOn && _unlocked) {
         _needsFirstRunWizard = NO;
         [self presentPanelWithSetup:YES];
+    }
+}
+
+/*
+ * The 1 Hz timer stops while the device sleeps, so the first tick after an
+ * unlock sees a huge gap and would credit UG_MAX_CREDIT_SECONDS of it even
+ * though nothing was used. Whenever the device goes from inactive (screen off
+ * or locked) to active, move the usage anchor to now: the inactive gap is not
+ * usage. Breaks are unaffected: they elapse in real time by design.
+ */
+- (void)rebaseClockIfBecameActive:(BOOL)wasActive
+{
+    if (!wasActive && _screenOn && _unlocked) {
+        ug_rebase_last_wall(&_state, UGNowSeconds());
     }
 }
 
@@ -523,7 +538,12 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     locked = ug_is_locked(&_state, now) && _screenOn && _unlocked &&
              !emergency && !_callActive;
 
-    sUGOverlayLocked = locked ? 1 : 0;
+    /* The window hides for the emergency valve and for any call, but the
+     * bypass hooks stay armed for as long as the valve window is open —
+     * including the whole duration of an emergency call, not just the 15 s
+     * deadline. Hiding the overlay must not hand out free SpringBoard access.
+     * A plain call that was not started from the overlay arms nothing. */
+    sUGOverlayLocked = (locked || _emergencyUntil > 0) ? 1 : 0;
 
     if (!_window) return;
 
@@ -632,7 +652,10 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
      * no call starts), so tapping and hanging up is not a way to stay out. */
     _emergencyUntil = UGNowSeconds() + kUGEmergencyNoCallSeconds;
     _emergencyCallSeen = NO;
-    sUGOverlayLocked = 0;
+    /* The window hides so the dialer is reachable, but the bypass hooks stay
+     * armed: only the overlay goes away, not the guard. syncUI keeps them
+     * armed for the whole emergency window. */
+    sUGOverlayLocked = 1;
     [_window setHidden:YES];
 
     emergencyURL = [NSURL URLWithString:@"tel:112"];
@@ -712,6 +735,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     if ([self enterInertModeIfNeeded]) return;
 
     [self refreshDeviceState];
+    [self rebaseClockIfBecameActive:(wasScreenOn && wasUnlocked)];
     if (!_unlocked && _panelPresented) [self dismissPanel];
     [self persistIfChanged:(_screenOn != wasScreenOn || _unlocked != wasUnlocked)];
     [self syncUI];
