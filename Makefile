@@ -5,7 +5,7 @@ INSTALL_TARGET_PROCESSES = SpringBoard
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = UsageGuard
-UsageGuard_FILES = Tweak.xm src/UGGuardCore.c src/UGPrefs.m src/UGOverlayWindow.m src/UGParentPanel.m src/UGRuntime.m
+UsageGuard_FILES = Tweak.x src/UGGuardCore.c src/UGPrefs.m src/UGOverlayWindow.m src/UGParentPanel.m src/UGRuntime.m
 UsageGuard_CFLAGS = -fobjc-arc
 UsageGuard_FRAMEWORKS = UIKit Foundation Security CoreTelephony
 

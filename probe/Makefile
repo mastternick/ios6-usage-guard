@@ -8,7 +8,7 @@ INSTALL_TARGET_PROCESSES = SpringBoard
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = UsageGuardProbe
-UsageGuardProbe_FILES = Tweak.xm
+UsageGuardProbe_FILES = Tweak.x
 UsageGuardProbe_FRAMEWORKS = UIKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk

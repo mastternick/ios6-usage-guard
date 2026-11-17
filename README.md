@@ -92,7 +92,7 @@ while a break is still active.
 Makefile                Theos build (armv7, iOS 6.0 deployment target)
 control                 Debian package metadata
 UsageGuard.plist        MobileSubstrate filter (com.apple.springboard)
-Tweak.xm                single SpringBoard bootstrap hook
+Tweak.x                single SpringBoard bootstrap hook
 src/UGGuardCore.{h,c}   pure C cycle engine, serialization, MM:SS formatting
 src/UGPrefs.{h,m}       plist persistence + PBKDF2 PIN vault and rate limit
 src/UGOverlayWindow.{h,m}  high-level window and break overlay UI
