@@ -1,6 +1,7 @@
 #import "UGPrefs.h"
 
 #import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonKeyDerivation.h>
 #import <Security/Security.h>
 #import <stdlib.h>
@@ -167,7 +168,7 @@ BOOL UGDebugLoggingEnabled(void)
     }
     _iterations = [_values[kUGPINIterationsKey] unsignedIntValue];
     _failures = [_values[kUGPINFailuresKey] integerValue];
-    _lockoutUntil = [_values[kUGPINLockoutUntilKey] longLongValue];
+    _lockoutUntil = [_values[kUGPINLockoutKey] longLongValue];
 
     sUGDebugLogging = [_values[kUGDebugKey] boolValue];
     return self;
