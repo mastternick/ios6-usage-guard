@@ -31,7 +31,7 @@ env:
   # so installing Theos there would let `make clean` delete the toolchain.
   THEOS: /home/runner/theos
   # Must match `runs-on` below; it is only used for cache keys.
-  RUNNER_IMAGE: ubuntu-22.04
+  RUNNER_IMAGE: ubuntu-24.04
   # Pins. Bump deliberately; a rolling Theos/SDK combination is not reproducible.
   THEOS_REF: 8167f59de02fd32cf45b16bfcb1330dfa5c9974c
   IOS_TOOLCHAIN_TAG: main-update_3-eabca92
@@ -50,7 +50,7 @@ jobs:
     name: armv7 iOS 6.1 cross-build
     # Pinned: the dep list, fakeroot alternative and prebuilt toolchain all
     # assume Ubuntu 22.04.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
