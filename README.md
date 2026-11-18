@@ -103,8 +103,9 @@ home-screen app that shows the same pane (see
 Preferences.app itself is not usable. The entry is a real controller
 (`isController` plus
 `detail` in the entry plist, `NSPrincipalClass` in the bundle's `Info.plist`),
-so tapping the row pushes `UGPreferencesController` — a `PSViewController`
-subclass that builds its own grouped table view — instead of a dead link cell.
+so tapping the row pushes `UGPreferencesController` — in this bundle build a
+`PSViewController` subclass that builds its own grouped table view — instead of
+a dead link cell.
 The pane has five sections, top to bottom:
 
 | section | rows |
@@ -139,22 +140,32 @@ The package installs a small companion app next to the tweak:
 | bundle | `/Applications/UsageGuard.app` |
 | bundle id | `org.usageguard.timer.app` |
 | executable | `UsageGuard` (armv7, signed like the other binaries) |
-| icon | **Usage Guard** on the home screen |
+| icon | none shipped — SpringBoard's generic placeholder, labelled **Usage Guard** |
 
 It is a **jailbreak app that the .deb installs into `/Applications`** — not an
 IPA, and not a sandboxed App Store app. That is deliberate. A sandboxed app gets
 its own container, so it cannot read
 `/var/mobile/Library/Preferences/org.usageguard.timelock.plist`, which is where
-the cycle state and the PIN vault live; it also could not reuse the pane's
-`PSViewController` base class. And it could not be distributed through the App
-Store at all, because it is the companion of a MobileSubstrate tweak. The only
-delivery route is the jailbreak package itself, which is why the app travels
-inside the same `.deb` (and why `Depends` lists `uikittools`: the `postinst`
-runs `uicache`).
+the cycle state and the PIN vault live. And it could not be distributed through
+the App Store at all, because it is the companion of a MobileSubstrate tweak.
+The only delivery route is the jailbreak package itself, which is why the app
+travels inside the same `.deb` (and why `Depends` lists `uikittools`: the
+`postinst` runs `uicache`).
 
-The app is **the configuration UI, not the enforcer**. It hosts the identical
-`UGPreferencesController` the Settings pane uses — same
-`initForContentSize:` initialiser, same rows — wrapped in a navigation
+The app ships no icon asset: `app/Resources/Info.plist` declares no
+`CFBundleIconFile`/`CFBundleIconFiles`, so the home screen shows SpringBoard's
+generic placeholder icon labelled **Usage Guard**. Adding a real
+`Icon.png`/`Icon@2x.png` later is not just a resource drop — the package payload
+is validated as exactly seven files, so a new icon also has to be added to the
+validator's `MAIN_PAYLOAD_FILES` list (see
+[Build — GitHub Actions](#build--github-actions-no-local-toolchain)).
+
+The app is **the configuration UI, not the enforcer**. It compiles the same
+`UGPreferencesController` source the Settings pane uses, with
+`-DUG_HOST_APP=1` — same `initForContentSize:` initialiser, same rows — but its
+base class is a local `UGControllerBase` (a plain `UIViewController`) rather
+than the Settings host's `PSViewController`, which only exists inside
+Preferences.app and is never linked here. It is wrapped in a navigation
 controller, so nothing can drift between the two hosts. SpringBoard's tweak
 still does all the accounting, the overlay and the PIN work.
 
@@ -168,10 +179,9 @@ the file once a second, so changes made from the break overlay's parent panel
 show up the same way. Backgrounding or closing the app changes nothing: the
 tweak enforces from SpringBoard.
 
-Launch it from the home screen. The icon appears after the package's `postinst`
-runs `uicache`; without that (or a reboot) iOS 6 has not registered the new
-bundle yet and the icon is missing. If the icon is missing, run `uicache` again
-or respring — the app is installed either way:
+Launch it from the home screen. The icon appears once the package's `postinst`
+runs `uicache`; if it still does not appear, a respring or a reboot fixes it —
+the app is installed either way:
 
 ```sh
 uicache -a
@@ -288,37 +298,52 @@ and writes one line per event:
 
 `pid` is the process that wrote the line — Preferences.app for the pane, and a
 fresh pid after every respring, which is how a restart can be told from a crash
-in the same session. The bundle records, in order: the bundle path it was loaded
-from, `+load` of the controller, `initForContentSize:` (with the result of
-`respondsToSelector:` for `setSpecifier:`, `setRootController:`,
-`setParentController:` and `viewWillBecomeVisible:`), `loadView`, table
-installation, `viewDidLoad`, `viewWillAppear:`, `viewDidAppear:` (with
-`setupComplete` and `hasPIN`), `viewWillDisappear:`, `dealloc`, every table cell
-built (section and row only - never cell text), every row selection, every
-action handler, every alert presented and dismissed (tag and button index), and
-`clearAuthorization` (including whether an alert was live). It also installs an
+in the same session. The bundle records, in order: `+load` of the controller
+(naming the `UsageGuardPrefs.bundle` copy the host loaded), `+load` of the trace
+installer (`bundle loaded:` with the same path, once the exception handler is
+installed), `initForContentSize:` (with the result of `respondsToSelector:` for
+`setSpecifier:`, `setRootController:`, `setParentController:` and
+`viewWillBecomeVisible:`), `loadView` and table installation, `viewDidLoad`,
+`viewWillAppear:`, `viewDidAppear:` (with `setupComplete` and `hasPIN`), the
+table cells of the rebuild that follows `viewWillAppear:` (at most sixteen per
+rebuild, section and row only - never cell text; the 1 Hz refresh does not trace
+rows, so the file is not flooded and the earlier record survives), every row
+selection, every action handler, every alert presented and dismissed (tag and
+button index), `viewWillDisappear:`, `clearAuthorization` (including whether an
+alert was live) and `dealloc`. It also installs an
 `NSSetUncaughtExceptionHandler`, so an uncaught exception appends
 
 ```
 EXCEPTION <name>: <reason>
-  stack[0] <symbol>
+  stack[0] exception-stack <symbol>
   ...
 ```
 
-before the process dies - which is exactly the information a "Settings closes
-when I tap Usage Guard" report lacks.
+The frames come from the exception's own `callStackSymbols:` (the throw site),
+tagged `exception-stack`; only when the exception carries no stack does the
+record fall back to `NSThread callStackSymbols` at handler time, tagged
+`thread-stack`, which usually shows just the rethrow path from
+`CFRunLoopRunSpecific` upwards. Both are capped at 64 frames. The record is
+written before the process dies - which is exactly the information a "Settings
+closes when I tap Usage Guard" report lacks.
 
 The log is **local to the device**; nothing is uploaded or sent anywhere. It is
-capped: once it passes 64 KB the file is emptied before the next line is
-written, so it cannot fill the preferences directory. It is written per line
+capped: once it passes 64 KB the previous record is kept as
+`org.usageguard.timer.trace.log.1` and a fresh `…trace.log` is started, so it
+cannot fill the preferences directory. It is written per line
 (open/append/close) so any thread can use it and a crash cannot leave the file
 locked; a write failure is silent by design.
 
-To read it, copy the file off with 3uTools (or any desktop file browser that can
-see `/var/mobile/Library/Preferences/`). The Information section of the pane
-shows the same path and the current size in the `Jurnal` row, and the
-`Șterge jurnalul` row at the end of that section deletes the file (the row then
-reads `absent sau gol`).
+To read it without SSH, use 3uTools' file browser: **3uTools → File System →
+`/var/mobile/Library/Preferences/`**, then export
+`org.usageguard.timer.trace.log` (and `org.usageguard.timer.trace.log.1` when
+it exists — that is the previous record, kept at rotation). Any desktop file
+browser that can see `/var/mobile/Library/Preferences/` works the same way. The
+Information section of the pane shows the same path and the current size in the
+`Jurnal` row, and the `Șterge jurnalul` row at the end of that section removes
+both generations — `org.usageguard.timer.trace.log` and, when present,
+`org.usageguard.timer.trace.log.1` — after which the row reads
+`absent sau gol`.
 
 ## Test overlay
 
@@ -359,7 +384,7 @@ UsageGuard.plist        MobileSubstrate filter (com.apple.springboard)
 Tweak.x                single SpringBoard bootstrap hook
 layout/Library/PreferenceLoader/Preferences/UsageGuard.plist
                         PreferenceLoader entry (the Settings row)
-layout/DEBIAN/postinst  maintainer script: runs uicache so the app icon appears
+layout/DEBIAN/postinst  maintainer script: runs uicache so the home-screen entry appears
 prefs/                  preference bundle sources and resources
 prefs/Resources/Info.plist  the bundle's Info.plist (staged into the bundle)
 prefs/UGPreferencesController.{h,m}  the grouped Settings pane (shared with the app)
@@ -444,7 +469,7 @@ The validator then fails the package unless
   and signed (`LC_CODE_SIGNATURE`); the bundle executable carries no
   `LC_ID_DYLIB`;
 * `control.tar` carries an executable (`0755`) `postinst` that runs `uicache`,
-  so the app icon appears without a reboot;
+  so the home-screen entry appears without a reboot;
 * `Architecture: iphoneos-arm` and `Depends:` list `mobilesubstrate`,
   `preferenceloader` and `uikittools`.
 
@@ -505,12 +530,13 @@ configuration app (`/Applications/UsageGuard.app/`), and it declares
 Cydia and dpkg refuse the install without PreferenceLoader (which puts the pane
 in Settings) or without uikittools (which provides `uicache`, used by the
 package's `postinst`). After installation the tweak starts with SpringBoard and
-a **Usage Guard** icon appears on the home screen once `uicache` has run; both
-the icon and the Settings row open the same configuration UI, and until the
-first-run setup is completed nothing is enforced.
+a **Usage Guard** entry appears on the home screen once `uicache` has run (with
+SpringBoard's generic placeholder icon — no icon asset ships); both it and the
+Settings row open the same configuration UI, and until the first-run setup is
+completed nothing is enforced.
 
 If the icon does not appear, the bundle is installed but SpringBoard has not
-rescanned `/Applications` yet — run `uicache -a` over SSH or respring:
+rescanned `/Applications` yet — run `uicache`, otherwise respring or reboot:
 
 ```sh
 ssh root@DEVICE_IP 'uicache -a'
@@ -519,8 +545,8 @@ ssh root@DEVICE_IP 'killall -9 SpringBoard'
 ```
 
 To update, install the newer `.deb` over the old one the same way
-(`dpkg -i`); the postinst runs `uicache` again, so the icon and version refresh
-without a reboot, and the preferences file is preserved.
+(`dpkg -i`); the postinst runs `uicache` again, so the entry appears without a
+manual respring, and the preferences file is preserved.
 
 To remove it: `dpkg -r org.usageguard.timer` (or `dpkg -P`) followed by a
 respring. The preferences file `org.usageguard.timelock.plist` lives in the
@@ -574,17 +600,19 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   fails the build when any of them is missing. If the row is there but the
   Status section reports no live runtime, SpringBoard has not injected the tweak
   or was restarted since — see Diagnostics above.
-* **No Usage Guard icon on the home screen.** The app is installed by the
+* **No Usage Guard entry on the home screen.** The app is installed by the
   package, but iOS 6 only registers a new `/Applications` bundle after
-  `uicache` (run by the package's `postinst`) or a reboot. Run `uicache -a` or
-  respring; `uikittools` is a declared dependency, so `uicache` should already
-  be on the device.
+  `uicache` (run by the package's `postinst`); if it still does not appear,
+  respring or reboot. `uikittools` is a declared dependency, so `uicache`
+  should already be on the device. Once the entry shows, expect SpringBoard's
+  generic placeholder icon: no icon asset ships.
 * **Settings closes when the pane opens, or the pane cannot be reached.** Use
-  the **Usage Guard** app on the home screen: it hosts the identical
-  `UGPreferencesController`, so every row works the same and a change is
+  the **Usage Guard** app on the home screen: it compiles the identical
+  `UGPreferencesController` source, so every row works the same and a change is
   announced to SpringBoard the same way. Both hosts append to
   `/var/mobile/Library/Preferences/org.usageguard.timer.trace.log`; copy it off
-  the device to see which host got how far.
+  the device to see which host got how far (see
+  [Local trace](#local-trace-settings-pane)).
 
 ## Limitations (honest list)
 
@@ -659,6 +687,13 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   needs the tweak's rootful preferences file. It also only configures: with the
   tweak uninstalled the app opens and shows the persisted state, but nothing
   is enforced.
+* **The app has no icon of its own.** `app/Resources/Info.plist` declares no
+  `CFBundleIconFile`/`CFBundleIconFiles` and no PNG ships, so iOS 6 draws
+  SpringBoard's generic placeholder for `UsageGuard.app` (labelled **Usage
+  Guard**, not an artwork icon). Adding one later is not a resource-only
+  change: the validator requires the payload to be exactly seven files, so
+  `Icon.png`/`Icon@2x.png` would also have to be added to its
+  `MAIN_PAYLOAD_FILES` list, and CI would fail the package until they are.
 * **No physical-device test was performed for this release.** CI cross-builds
   the package, `scripts/validate_deb.py` checks the payload statically and the
   host C tests cover the cycle engine; nothing in this repository exercises the

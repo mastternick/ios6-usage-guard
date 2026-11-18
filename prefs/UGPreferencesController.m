@@ -105,6 +105,13 @@ static const CGFloat kUGStandardRowHeight = 44.0f;
 static const CGFloat kUGPathRowHeight = 62.0f;
 static const NSTimeInterval kUGRefreshInterval = 1.0;
 
+/* Row traces written for one real rebuild. The 1 Hz cadence reload writes none:
+ * at ~65 bytes per row it filled the 64 KB trace file in about two minutes and
+ * pushed the Preferences crash record out of it. One budget covers every row of
+ * a full screen (and then some), so a rebuild still shows which rows the host
+ * asked for without costing anything when nothing changed. */
+static const NSInteger kUGRowTraceBudget = 16;
+
 #pragma mark - Helpers
 
 static NSString *UGFormatSeconds(long long seconds)
@@ -165,6 +172,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     NSDictionary *_status;
     NSString *_signature;
     NSTimer *_refreshTimer;
+
+    /* Rows left to trace in the current rebuild; see kUGRowTraceBudget. */
+    NSInteger _rowTraceBudget;
 
     NSInteger _alertCount;
 
@@ -284,12 +294,24 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
  * whichever of the two the host runs first (or if it releases the view). */
 - (void)ug_installTableView
 {
-    if (_tableView) return;
-
     UIView *host = self.view;
     if (!host) {
         UGTrace(@"ug_installTableView: no container view");
         return;
+    }
+
+    /* Single-install fast path: the table is already in this container. */
+    if (_tableView && _tableView.superview == host) return;
+
+    if (_tableView) {
+        /* A host replaced self.view, so the old table now hangs off a view that
+         * is no longer on screen. Drop it and build one for the new container;
+         * the early return above used to leave the re-created view blank. */
+        UGTrace(@"ug_installTableView: rebuilding, table superseded");
+        _tableView.dataSource = nil;
+        _tableView.delegate = nil;
+        [_tableView removeFromSuperview];
+        _tableView = nil;
     }
 
     _tableView = [[UITableView alloc] initWithFrame:host.bounds
@@ -334,6 +356,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
                    selector:@selector(applicationDidEnterBackground:)
                        name:UIApplicationDidEnterBackgroundNotification
                      object:nil];
+        [center addObserver:self
+                   selector:@selector(applicationDidBecomeActive:)
+                       name:UIApplicationDidBecomeActiveNotification
+                     object:nil];
     }
 
     UGTrace(@"viewDidLoad: exit tableView=%d", (int)(_tableView != nil));
@@ -360,9 +386,12 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     }
 
     /* Force one rebuild: the table may have been laid out before the state was
-     * read, and the window is not attached yet during viewWillAppear. */
+     * read, and the window is not attached yet during viewWillAppear. This is
+     * the one rebuild whose rows are worth tracing: it is the step that runs
+     * just before a host crash. */
     _signature = nil;
-    [self refreshFromDiskReloading:NO];
+    _rowTraceBudget = kUGRowTraceBudget;
+    [self refreshFromDiskReloading:NO rowTrace:YES];
     [_tableView reloadData];
     [self startRefreshTimer];
 
@@ -418,6 +447,25 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 {
     (void)notification;
     [self clearAuthorization];
+}
+
+/* First-run setup must survive a trip through the background. In the app the
+ * root controller lives as long as the process, so viewDidAppear: never runs
+ * again; an auto-lock, a call or Home goes through clearAuthorization, which
+ * dismisses the wizard and leaves _wizardShown set. Without this the only
+ * working UI on the device could never finish setup until the app is
+ * force-quit, and the guard stayed inert meanwhile. */
+- (void)applicationDidBecomeActive:(NSNotification *)notification
+{
+    (void)notification;
+
+    if (!_ipc || [_ipc setupComplete]) return;
+    if (_alertCount > 0) return;
+    if (![self isViewLoaded] || !self.view.window) return;
+
+    _wizardShown = NO;
+    UGTrace(@"applicationDidBecomeActive: re-arming wizard, setup incomplete");
+    [self beginWizard];
 }
 
 - (void)clearAuthorization
@@ -477,10 +525,11 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     /* An alert owns the screen; reloading underneath it would be a flicker and
      * could yank the row the parent is looking at. */
     if (_alertCount > 0) return;
-    [self refreshFromDiskReloading:YES];
+    /* Cadence reload: no row trace, or the file grows by ~0.5 KB/s. */
+    [self refreshFromDiskReloading:YES rowTrace:NO];
 }
 
-- (void)refreshFromDiskReloading:(BOOL)reload
+- (void)refreshFromDiskReloading:(BOOL)reload rowTrace:(BOOL)rowTrace
 {
     [_ipc loadState:&_state];
     _status = [_ipc statusSnapshot];
@@ -490,6 +539,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     _signature = signature;
 
     if (changed && reload && _alertCount == 0 && [self isViewLoaded] && self.view.window) {
+        _rowTraceBudget = rowTrace ? kUGRowTraceBudget : 0;
         [_tableView reloadData];
     }
 }
@@ -683,12 +733,14 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     return [NSString stringWithFormat:@"%@ · %@", path, size];
 }
 
-/* Deletes the trace file. Nothing is traced after the delete, because a trace
- * line would immediately recreate the file the parent just removed. */
+/* Deletes the trace file. The rebuild that follows must not write a row trace,
+ * or the file the parent just removed comes back before the Jurnal row reads
+ * its size and the row can never say the log is empty. */
 - (void)deleteTraceLog
 {
     UGTrace(@"deleteTraceLog: entry size=%llu", UGTraceFileSize());
     UGTraceRemoveLog();
+    _rowTraceBudget = 0;
     [_tableView reloadData];
 }
 
@@ -872,8 +924,13 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 {
     (void)tableView;
 
-    UGTrace(@"cellForRow: section=%ld row=%ld",
-            (long)indexPath.section, (long)indexPath.row);
+    /* Only a real rebuild gets row traces, and only for the first screenful;
+     * the 1 Hz cadence reload must not fill the file with them. */
+    if (_rowTraceBudget > 0) {
+        _rowTraceBudget--;
+        UGTrace(@"cellForRow: section=%ld row=%ld",
+                (long)indexPath.section, (long)indexPath.row);
+    }
 
     switch (indexPath.section) {
         case kUGSectionStatus:
@@ -1041,7 +1098,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
         return NO;
     }
 
-    [self refreshFromDiskReloading:YES];
+    [self refreshFromDiskReloading:YES rowTrace:YES];
     return YES;
 }
 
@@ -1059,7 +1116,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     UGTrace(@"setRequirePIN: %d", (int)required);
 
     [_ipc setRequirePIN:required];
-    [self refreshFromDiskReloading:YES];
+    [self refreshFromDiskReloading:YES rowTrace:YES];
 }
 
 - (void)enabledSwitchChanged:(UISwitch *)sender
@@ -1388,7 +1445,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
     /* The parent just chose it, so the pane stays unlocked. */
     _authorized = YES;
-    [self refreshFromDiskReloading:YES];
+    [self refreshFromDiskReloading:YES rowTrace:YES];
     [self showNotice:@"Cod PIN salvat." title:@"Securitate"];
 }
 
@@ -1418,7 +1475,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     _wizardStep = kUGWizardStepIdle;
     _wizardPIN = nil;
     _pendingPIN = nil;
-    [self refreshFromDiskReloading:YES];
+    [self refreshFromDiskReloading:YES rowTrace:YES];
 }
 
 - (void)presentWizardStep
@@ -1639,7 +1696,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     /* The parent just picked the PIN, so the pane stays unlocked. */
     _authorized = YES;
     _wizardPIN = nil;
-    [self refreshFromDiskReloading:YES];
+    [self refreshFromDiskReloading:YES rowTrace:YES];
 }
 
 #pragma mark - Alerts

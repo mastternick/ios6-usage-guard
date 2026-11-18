@@ -12,8 +12,10 @@
  * Rules that make it safe to call from anywhere, including a crash path:
  *   - open / append / close per line, no state shared between calls, so any
  *     thread may call it and a process death cannot leave a locked handle;
- *   - the file is emptied before a line is written once it passes 64 KB, so it
- *     can never grow without bound on a 3.5" device;
+ *   - once the file passes 64 KB the next line rotates it to
+ *     UG_TRACE_PATH ".1" (replacing any previous .1) and starts a fresh file,
+ *     so it cannot grow without bound on a 3.5" device while the previous
+ *     crash record survives one generation;
  *   - the whole body is wrapped in @try/@catch and every failure is silent: a
  *     diagnostic helper must never turn a working pane into a crashing one.
  *
@@ -29,5 +31,6 @@ NSString *UGTracePath(void);
 /* Current size in bytes, or 0 when the file is absent or unreadable. */
 unsigned long long UGTraceFileSize(void);
 
-/* Deletes the file. Returns YES when it no longer exists afterwards. */
+/* Deletes the file and its rotated .1 generation. Returns YES when the main
+ * file no longer exists afterwards. */
 BOOL UGTraceRemoveLog(void);

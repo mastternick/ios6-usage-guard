@@ -39,8 +39,10 @@ What it enforces, on a single .deb:
       preference bundle + app layout only; the probe's two-file layout depends
       on ``mobilesubstrate`` alone)
     * ``postinst`` present, with all of the 0755 permission bits set
-      (``mode & 0755 == 0755``; 0750 or 0700 fails) and referencing ``uicache``
-      (tweak + preference bundle + app layout only)
+      (``mode & 0755 == 0755``; 0750 or 0700 fails) and running ``uicache`` as a
+      command -- ``uicache``, ``exec uicache`` or ``su -c uicache`` (tweak +
+      preference bundle + app layout only; a mention inside a comment is not a
+      refresh)
 
   payload layout
     * every path is relative, normalised, free of ``..``, ``/home/``, ``/dev/``,
@@ -77,6 +79,8 @@ What it enforces, on a single .deb:
     * cputype == 12 (CPU_TYPE_ARM), cpusubtype == 9 (CPU_SUBTYPE_ARM_V7)
     * LC_VERSION_MIN_IPHONEOS present with min OS 6.0.0
     * LC_CODE_SIGNATURE present
+    * load commands parse cleanly (truncated or overrunning load commands are
+      rejected, as for the dylib and the bundle)
 
   app Info.plist (tweak + preference bundle + app layout only)
     * parses as a property list
@@ -632,7 +636,8 @@ def validate_configuration_app(report, payload_files, fields):
     if binary is None:
         for name in ("app binary is armv7 MH_EXECUTE",
                      "app binary min OS 6.0.0",
-                     "app binary signed"):
+                     "app binary signed",
+                     "app Mach-O load commands clean"):
             report.fail(name, "%s is missing from the payload" % APP_BINARY)
     else:
         # MH_EXECUTE only: a dylib or bundle in /Applications/UsageGuard.app
@@ -652,6 +657,11 @@ def validate_configuration_app(report, payload_files, fields):
                      "%d.%d.%d" % info["min_os"] if "min_os" in info else "missing")
         report.check("app binary signed", not unsigned,
                      "unsigned" if unsigned else "signed")
+        # A load command table that is truncated or overruns sizeofcmds makes
+        # dyld refuse the binary before main() runs, exactly as for the dylib
+        # and the preference bundle.
+        report.check("app Mach-O load commands clean", not errors,
+                     "ok" if not errors else "; ".join(errors))
 
     # The app's identity is what makes it a second host for the same
     # preferences file: the bundle id is stable, the executable names the binary
@@ -690,6 +700,29 @@ def validate_configuration_app(report, payload_files, fields):
                  not problems, "; ".join(problems) or detail)
 
 
+def icon_cache_invocation(payload):
+    """Return the first postinst line that actually runs uicache, else None.
+
+    A ``uicache`` mention inside a comment does not refresh anything, so only a
+    line whose first command token is the tool counts. ``exec uicache`` and
+    ``su -c uicache`` (including the quoted ``su -c 'uicache -a'`` form) are
+    accepted because they run the same command.
+    """
+    for raw in payload.decode("utf-8", "replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        tokens = line.split()
+        if tokens[0] == "exec" and len(tokens) > 1:
+            tokens = tokens[1:]
+        if tokens[0] == "su" and "-c" in tokens:
+            remainder = " ".join(tokens[tokens.index("-c") + 1:]).strip("'\"")
+            tokens = remainder.split()
+        if tokens and tokens[0] == ICON_CACHE_TOOL:
+            return line
+    return None
+
+
 def validate_maintainer_scripts(report, member, payload):
     """Check the control.tar postinst: present, executable and runs uicache."""
     if member is None or payload is None:
@@ -706,10 +739,12 @@ def validate_maintainer_scripts(report, member, payload):
                  else "mode %04o, expected at least %04o" % (mode, MAIN_POSTINST_MODE))
     # iOS 6 only registers an /Applications bundle after uicache (or a reboot),
     # so a postinst that never calls it ships an app with no home-screen icon.
-    refreshes = ICON_CACHE_TOOL.encode() in payload
-    report.check("postinst refreshes the icon cache", refreshes,
-                 "%s invoked" % ICON_CACHE_TOOL if refreshes
-                 else "%s is not referenced" % ICON_CACHE_TOOL)
+    # A comment that merely says "uicache" does not run anything.
+    invocation = icon_cache_invocation(payload)
+    report.check("postinst refreshes the icon cache", invocation is not None,
+                 "%s runs %r" % (MAIN_POSTINST, invocation) if invocation
+                 else "%s has no %s command (a comment mention does not count)"
+                 % (MAIN_POSTINST, ICON_CACHE_TOOL))
 
 
 def validate(deb_path, args):

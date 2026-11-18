@@ -132,6 +132,20 @@ uicache -a >/dev/null 2>&1 || uicache >/dev/null 2>&1 || true
 exit 0
 """
 
+# Merely saying "uicache" in a comment refreshes nothing; only a command line
+# that actually runs the tool satisfies the check.
+POSTINST_COMMENTED = """#!/bin/sh
+# uicache -a would refresh the icon cache here
+echo "installed"
+exit 0
+"""
+
+# `exec uicache ... || true` is still a real invocation.
+POSTINST_EXEC = """#!/bin/sh
+exec uicache >/dev/null 2>&1 || true
+exit 0
+"""
+
 
 # --------------------------------------------------------------------------- #
 # Synthetic Mach-O
@@ -427,6 +441,30 @@ def cases(tmpdir):
                                with_entry(MAIN_ENTRIES, APP_INFO_PLIST_KEY,
                                           APP_INFO_PLIST.replace(APP_BUNDLE_ID,
                                                                  "org.usageguard.timer").encode()))
+    main_app_bad_version = main_deb("bad-main-app-version",
+                                    with_entry(MAIN_ENTRIES, APP_INFO_PLIST_KEY,
+                                               APP_INFO_PLIST.replace("<string>0.0.1</string>",
+                                                                      "<string>0.0.9</string>").encode()))
+    main_app_bad_executable = main_deb("bad-main-app-executable",
+                                       with_entry(MAIN_ENTRIES, APP_INFO_PLIST_KEY,
+                                                  APP_INFO_PLIST.replace("<string>UsageGuard</string>",
+                                                                         "<string>UsageGuardPrefs</string>",
+                                                                         1).encode()))
+    main_app_minos = main_deb("bad-main-app-min-ios",
+                              with_entry(MAIN_ENTRIES, APP_BINARY_KEY,
+                                         macho(filetype=2, id_dylib=False, min_os=(7, 0, 0))))
+    # An armv7 + arm64 universal would install on the 4S but is not a plain
+    # armv7 iOS 6 binary; the container rule rejects any multi-slice app.
+    app_arm64_slice = fat_wrap([(12, 9, macho(filetype=2, id_dylib=False)),
+                                (22, 2, macho(filetype=2, id_dylib=False))])
+    main_app_arm64 = main_deb("bad-main-app-arm64",
+                              with_entry(MAIN_ENTRIES, APP_BINARY_KEY, app_arm64_slice))
+    # 28-byte header + 8 bytes of the 32-byte load-command table: the header
+    # still claims 32 bytes, so the command table is truncated.
+    truncated_app_binary = macho(filetype=2, id_dylib=False)[:36]
+    main_app_truncated = main_deb("bad-main-app-truncated-load-commands",
+                                  with_entry(MAIN_ENTRIES, APP_BINARY_KEY,
+                                             truncated_app_binary))
     main_extra_app_file = main_deb("bad-main-extra-app-file",
                                    MAIN_ENTRIES + [("%s/Extra.txt" % APP_BUNDLE_DIR, b"x\n")])
 
@@ -434,6 +472,10 @@ def cases(tmpdir):
     main_no_postinst = main_deb("bad-main-no-postinst", MAIN_ENTRIES, postinst=None)
     main_postinst_not_executable = main_deb("bad-main-postinst-not-executable", MAIN_ENTRIES,
                                             postinst_mode=0o644)
+    main_postinst_commented = main_deb("bad-main-postinst-uicache-comment", MAIN_ENTRIES,
+                                       postinst=POSTINST_COMMENTED)
+    main_postinst_exec = main_deb("good-main-postinst-exec-uicache", MAIN_ENTRIES,
+                                  postinst=POSTINST_EXEC)
 
     # PreferenceLoader/PreferenceBundles/Applications packaging belongs to
     # org.usageguard.timer; none of it may slip into the two-file probe.
@@ -538,12 +580,26 @@ def cases(tmpdir):
          "app binary signed", []),
         ("app Info.plist with the wrong bundle id rejected", main_app_bad_id, 1,
          "CFBundleIdentifier is 'org.usageguard.timer'", []),
+        ("app CFBundleShortVersionString != control Version rejected", main_app_bad_version, 1,
+         "CFBundleShortVersionString is '0.0.9', expected '0.0.1' (control Version)", []),
+        ("app Info.plist with the wrong CFBundleExecutable rejected", main_app_bad_executable, 1,
+         "CFBundleExecutable is 'UsageGuardPrefs'", []),
+        ("app deployment target 7.0 rejected", main_app_minos, 1,
+         "app binary min OS 6.0.0", []),
+        ("app binary with an arm64 slice rejected", main_app_arm64, 1,
+         "app binary is armv7 MH_EXECUTE", []),
+        ("app binary with truncated load commands rejected", main_app_truncated, 1,
+         "app Mach-O load commands clean", []),
         ("extra file inside UsageGuard.app rejected", main_extra_app_file, 1,
          "unexpected: %s/Extra.txt" % APP_BUNDLE_DIR, []),
         ("main package without postinst rejected", main_no_postinst, 1,
          "postinst present", []),
         ("non-executable postinst rejected", main_postinst_not_executable, 1,
          "postinst is executable", []),
+        ("postinst mentioning uicache only in a comment rejected", main_postinst_commented, 1,
+         "postinst refreshes the icon cache", []),
+        ("postinst running exec uicache ... || true accepted", main_postinst_exec, 0,
+         "postinst refreshes the icon cache", []),
         ("probe package with an Applications/ directory rejected", probe_app_dir, 1,
          "only allowed in package org.usageguard.timer", []),
         ("arm64 slice rejected", wrong_arch, 1, "CPU_TYPE_ARM", []),
