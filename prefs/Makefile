@@ -15,7 +15,7 @@ UsageGuardPrefs_FILES = UGPreferencesController.m UGSettingsIPC.m ../src/UGPrefs
 UsageGuardPrefs_INSTALL_PATH = /Library/PreferenceBundles
 UsageGuardPrefs_CFLAGS = -fobjc-arc -I../src
 UsageGuardPrefs_FRAMEWORKS = UIKit Foundation Security
-UsageGuardPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup
+UsageGuardPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup -Wl,-bundle
 
 # A .bundle must carry MH_BUNDLE. Theos links an instance with -dynamiclib by
 # default, which produces an MH_DYLIB (and a stray LC_ID_DYLIB install name) in
