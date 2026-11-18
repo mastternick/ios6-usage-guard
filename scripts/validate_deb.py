@@ -32,7 +32,7 @@ What it enforces, on a single .deb:
     * ``Package`` and ``Version`` present and non-empty
     * ``Depends`` lists ``mobilesubstrate`` (optionally with a version clause)
     * ``Depends`` lists ``preferenceloader`` (tweak + preference bundle layout
-      only; the probe must stay dependency-free)
+      only; the probe's two-file layout depends on ``mobilesubstrate`` alone)
 
   payload layout
     * every path is relative, normalised, free of ``..``, ``/home/``, ``/dev/``,
@@ -54,9 +54,11 @@ What it enforces, on a single .deb:
     * LC_ID_DYLIB install name is /Library/MobileSubstrate/DynamicLibraries/<name>.dylib
 
   Mach-O (the preference bundle binary, tweak + preference bundle layout only)
-    * thin little-endian 32-bit Mach-O, filetype MH_DYLIB or MH_BUNDLE (Theos
-      links the bundle with -dynamiclib, and PreferenceLoader loads either
-      through CFBundleExecutable; MH_EXECUTE and the rest are rejected)
+    * thin little-endian 32-bit Mach-O, filetype MH_BUNDLE (8) only: the
+      instance sets ``_DYNAMIC_LIBRARY = NO`` and links with ``-bundle``, so
+      MH_DYLIB, MH_EXECUTE and every other filetype are rejected
+    * no LC_ID_DYLIB (a ``-bundle`` link installs no dylib identity, so a
+      dylib-shaped bundle executable is rejected)
     * cputype == 12 (CPU_TYPE_ARM), cpusubtype == 9 (CPU_SUBTYPE_ARM_V7)
     * LC_VERSION_MIN_IPHONEOS present with min OS 6.0.0
     * LC_CODE_SIGNATURE present
@@ -109,11 +111,11 @@ MH_BUNDLE = 8
 FILETYPE_NAMES = {MH_OBJECT: "MH_OBJECT", MH_EXECUTE: "MH_EXECUTE",
                   MH_DYLIB: "MH_DYLIB", MH_BUNDLE: "MH_BUNDLE"}
 
-# Theos' bundle.mk links a preference bundle with -dynamiclib, so its
-# executable is a MH_DYLIB; a real MH_BUNDLE is equally loadable through
-# CFBundleExecutable. PreferenceLoader never inspects the filetype, so both
-# are accepted and everything else is rejected.
-BUNDLE_FILETYPES = (MH_DYLIB, MH_BUNDLE)
+# prefs/Makefile sets `UsageGuardPrefs_DYNAMIC_LIBRARY = NO` and links with
+# `-Wl,-bundle`, so the preference bundle executable is a real MH_BUNDLE
+# (filetype 8) and carries no LC_ID_DYLIB. A dylib-shaped bundle -- Theos'
+# bundle.mk default -- is rejected.
+BUNDLE_FILETYPES = (MH_BUNDLE,)
 
 LC_CODE_SIGNATURE = 0x1D
 LC_VERSION_MIN_IPHONEOS = 0x25
@@ -463,7 +465,7 @@ def wants_preference_layout(fields):
     """Return True when this package must carry the preference bundle payload.
 
     The package id decides, so a package cannot opt into the weaker two-file
-    layout by shipping a two-file payload. The probe keeps the dependency-free
+    layout by shipping a two-file payload. The probe keeps the two-file
     layout, and so does any unknown package id, which is why the probe (run with
     ``--expect-package org.usageguard.probe``) is never asked for
     ``preferenceloader``.
@@ -480,14 +482,15 @@ def validate_preference_bundle(report, payload_files):
     bundle_key = "%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE)
     bundle_payload = payload_files.get(bundle_key)
     if bundle_payload is None:
-        for name in ("bundle binary is armv7 MH_DYLIB or MH_BUNDLE",
+        for name in ("bundle binary is armv7 MH_BUNDLE",
                      "bundle LC_VERSION_MIN_IPHONEOS 6.0.0",
-                     "bundle LC_CODE_SIGNATURE present"):
+                     "bundle LC_CODE_SIGNATURE present",
+                     "bundle has no LC_ID_DYLIB"):
             report.fail(name, "%s is missing from the payload" % bundle_key)
     else:
         info, errors = parse_macho(bundle_payload, expected_filetype=BUNDLE_FILETYPES)
         unsigned = [e for e in errors if "LC_CODE_SIGNATURE" in e]
-        report.check("bundle binary is armv7 MH_DYLIB or MH_BUNDLE",
+        report.check("bundle binary is armv7 MH_BUNDLE",
                      not architecture_errors(errors),
                      "filetype=%s (%s), cputype=%s subtype=%s%s"
                      % (info.get("filetype", "?"),
@@ -499,6 +502,13 @@ def validate_preference_bundle(report, payload_files):
                      "%d.%d.%d" % info["min_os"] if "min_os" in info else "missing")
         report.check("bundle LC_CODE_SIGNATURE present", not unsigned,
                      "unsigned" if unsigned else "signed")
+        # A -bundle link has no dylib identity to install, and Preferences.app
+        # only dlopen()s this binary; an LC_ID_DYLIB means it was linked
+        # -dynamiclib, i.e. it is still a dylib wearing a .bundle name.
+        install_name = info.get("install_name")
+        report.check("bundle has no LC_ID_DYLIB", install_name is None,
+                     "no LC_ID_DYLIB" if install_name is None
+                     else "carries LC_ID_DYLIB install name %r (dylib-shaped bundle)" % install_name)
         report.check("bundle Mach-O load commands clean", not errors,
                      "ok" if not errors else "; ".join(errors))
 

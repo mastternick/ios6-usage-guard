@@ -302,11 +302,11 @@ The validator then fails the package unless
 
 * the payload is exactly five files — the armv7 `MH_DYLIB` and its filter plist
   under `Library/MobileSubstrate/DynamicLibraries/`, the armv7 `MH_BUNDLE`
-  executable (`UsageGuardPrefs`) and its `Info.plist` under
+  executable (`UsageGuardPrefs`, filetype 8) and its `Info.plist` under
   `Library/PreferenceBundles/UsageGuardPrefs.bundle/`, and the PreferenceLoader
-  entry `Library/PreferenceLoader/Preferences/UsageGuard.plist` (the validator
-  also accepts `MH_DYLIB` for the bundle executable, since Theos links a bundle
-  with `-dynamiclib` depending on the instance flags);
+  entry `Library/PreferenceLoader/Preferences/UsageGuard.plist` (the bundle is
+  linked `-bundle` with `_DYNAMIC_LIBRARY = NO`, so the validator rejects a
+  dylib-shaped bundle executable, including one carrying an `LC_ID_DYLIB`);
 * the filter plist names `com.apple.springboard` and the PreferenceLoader plist
   names the `UsageGuardPrefs` bundle;
 * the PreferenceLoader entry is a real controller — `entry.isController` is
@@ -316,14 +316,15 @@ The validator then fails the package unless
   the binary that must exist) and a non-empty `NSPrincipalClass` (the class
   PreferenceLoader instantiates; the two keys are independent and may differ);
 * both binaries are single-slice **armv7**, `LC_VERSION_MIN_IPHONEOS` 6.0.0 and
-  signed (`LC_CODE_SIGNATURE`);
+  signed (`LC_CODE_SIGNATURE`); the bundle executable carries no `LC_ID_DYLIB`;
 * `Architecture: iphoneos-arm` and `Depends:` list `mobilesubstrate` and
   `preferenceloader`.
 
-The probe package keeps its own, dependency-free two-file payload (dylib plus
-filter plist); the validator checks each layout separately, and it rejects
-`Library/PreferenceLoader` or `Library/PreferenceBundles` content — even an
-empty directory — in any package other than `org.usageguard.timer`.
+The probe package keeps its own two-file payload (dylib plus filter plist)
+whose only dependency is `mobilesubstrate`; the validator checks each layout
+separately, and it rejects `Library/PreferenceLoader` or
+`Library/PreferenceBundles` content — even an empty directory — in any package
+other than `org.usageguard.timer`.
 
 ### Local build (optional, requires your own toolchain)
 

@@ -153,7 +153,7 @@ jobs:
             org.usageguard.timer.status.plist \
             org.usageguard.timer.disable; do
             offenders="$({ grep -rnF "$defined_path" src prefs || :; } \
-              | grep -vF 'src/UGVersion.h:' || :)"
+              | grep -v '^src/UGVersion\.h:' || :)"
             if [ -n "$offenders" ]; then
               echo "::error::$defined_path must be defined only in src/UGVersion.h; these files carry their own copy:"
               printf '%s\n' "$offenders"
@@ -597,11 +597,11 @@ jobs:
               "```",
               "",
               "The dylib is an armv7 `MH_DYLIB`; the preference bundle executable an",
-              "armv7 `MH_BUNDLE`. Both are signed. The validator accepts either filetype",
-              "for the bundle executable, because Theos may link a bundle with `-dynamiclib`",
-              "depending on the instance flags. Because of the bundle the package depends",
-              "on `preferenceloader`. `%s` stays a dependency-free two-file package" % probe_name,
-              "(dylib plus filter plist).",
+              "armv7 `MH_BUNDLE` (filetype 8). Both are signed, and the bundle carries",
+              "no `LC_ID_DYLIB`: it is linked `-bundle`, and the validator rejects a",
+              "dylib-shaped bundle. Because of the bundle the package depends",
+              "on `preferenceloader`. `%s` stays a two-file package" % probe_name,
+              "(dylib plus filter plist) whose only dependency is `mobilesubstrate`.",
               "",
               "<details><summary>Usage Guard — %s</summary>" % main_name,
               "",

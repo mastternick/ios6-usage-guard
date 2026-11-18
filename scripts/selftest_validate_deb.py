@@ -113,10 +113,9 @@ def macho(cputype=12, cpusubtype=9, filetype=6, min_os=(6, 0, 0),
           id_dylib=True):
     """Build a minimal thin Mach-O dylib (or a fat wrapper when fat=True).
 
-    ``filetype`` is passed through untouched. Theos' bundle.mk links the
-    preference bundle with -dynamiclib, so the real executable is a MH_DYLIB
-    (6) carrying an LC_ID_DYLIB; a hand-built MH_BUNDLE (8) uses
-    ``id_dylib=False`` instead.
+    ``filetype`` is passed through untouched and ``id_dylib`` decides whether an
+    LC_ID_DYLIB install name is emitted: the tweak is a MH_DYLIB (6) with one,
+    the preference bundle a MH_BUNDLE (8) linked ``-bundle`` without one.
     """
     commands = b""
     ncmds = 0
@@ -256,7 +255,7 @@ GOOD_ENTRIES = [
     ("%s/Synthetic.plist" % DYLIB_DIR, FILTER_PLIST.encode()),
 ]
 
-# The probe package: dependency-free, two-file payload, identified by its id.
+# The probe package: two-file payload (only dependency: mobilesubstrate).
 PROBE_CONTROL = CONTROL_TEMPLATE.format(
     package="org.usageguard.probe",
     architecture="iphoneos-arm",
@@ -307,7 +306,7 @@ def cases(tmpdir):
                                               GOOD_ENTRIES[1]])
     good_dmpl = make_deb_dmpl(os.path.join(tmpdir, "good-dmpl-default.deb"), GOOD_ENTRIES, GOOD_CONTROL)
 
-    # Probe layout: identified by package id, dependency-free, two files.
+    # Probe layout: identified by package id, two files.
     good_probe = deb("good-probe-layout", GOOD_ENTRIES, control=PROBE_CONTROL)
 
     # Main layout: the five-file payload including the preference bundle.
@@ -324,12 +323,19 @@ def cases(tmpdir):
                                with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
                                           macho(filetype=8, id_dylib=False, code_signature=False)),
                                control=MAIN_CONTROL)
-    # What Theos actually produces: bundle.mk links with -dynamiclib, so the
-    # executable is a MH_DYLIB with an LC_ID_DYLIB and must validate.
-    main_bundle_dylib = deb("good-main-bundle-dylib",
+    # Theos' bundle.mk default: -dynamiclib yields a MH_DYLIB with a stray
+    # LC_ID_DYLIB. prefs/Makefile opts out with _DYNAMIC_LIBRARY = NO, so the
+    # dylib-shaped executable must be rejected.
+    main_bundle_dylib = deb("bad-main-bundle-dylib",
                             with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
                                        macho(filetype=6, install_base=PREFERENCE_BUNDLE)),
                             control=MAIN_CONTROL)
+    # A MH_BUNDLE that still carries an LC_ID_DYLIB was linked -dynamiclib
+    # under another name; the install name betrays it.
+    main_bundle_id_dylib = deb("bad-main-bundle-id-dylib",
+                               with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                          macho(filetype=8, install_base=PREFERENCE_BUNDLE)),
+                               control=MAIN_CONTROL)
     main_bundle_exec = deb("bad-main-bundle-exec",
                            with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
                                       macho(filetype=2, id_dylib=False)),
@@ -361,7 +367,7 @@ def cases(tmpdir):
     main_no_preferenceloader = deb("bad-main-no-preferenceloader", MAIN_ENTRIES,
                                    control=MAIN_CONTROL.replace("preferenceloader, ", ""))
     # PreferenceLoader/PreferenceBundles packaging belongs to org.usageguard.timer;
-    # an empty directory tree must not slip into the dependency-free probe.
+    # an empty directory tree must not slip into the two-file probe.
     probe_pref_dirs = deb("bad-probe-preference-dirs",
                           GOOD_ENTRIES + [("Library/PreferenceLoader/Preferences/", None)],
                           control=PROBE_CONTROL)
@@ -427,12 +433,14 @@ def cases(tmpdir):
          "unexpected: %s/Extra.strings" % BUNDLE_DIR, []),
         ("main package with a two-file payload rejected", main_probe_payload, 1,
          "unexpected: %s/Synthetic.dylib" % DYLIB_DIR, []),
-        ("bundle executable as MH_DYLIB accepted", main_bundle_dylib, 0,
-         "filetype=6 (MH_DYLIB), cputype=12 subtype=9", []),
+        ("bundle executable as MH_DYLIB rejected", main_bundle_dylib, 1,
+         "filetype is 6 (MH_DYLIB), expected 8 (MH_BUNDLE)", []),
+        ("bundle binary carrying LC_ID_DYLIB rejected", main_bundle_id_dylib, 1,
+         "bundle has no LC_ID_DYLIB", []),
         ("arm64 bundle binary rejected", main_bundle_arm64, 1,
-         "bundle binary is armv7 MH_DYLIB or MH_BUNDLE", []),
+         "bundle binary is armv7 MH_BUNDLE", []),
         ("MH_EXECUTE bundle binary rejected", main_bundle_exec, 1,
-         "filetype is 2 (MH_EXECUTE), expected 6 (MH_DYLIB) or 8 (MH_BUNDLE)", []),
+         "filetype is 2 (MH_EXECUTE), expected 8 (MH_BUNDLE)", []),
         ("unsigned bundle binary rejected", main_bundle_unsigned, 1,
          "bundle LC_CODE_SIGNATURE", []),
         ("PreferenceLoader plist naming the wrong bundle rejected", main_bad_prefs_plist, 1,
