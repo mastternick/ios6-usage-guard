@@ -112,10 +112,14 @@ The pane has five sections, top to bottom:
 
 The pane keeps no copy of the state: every read reloads the preferences file and
 every change is a read-modify-write that is announced to SpringBoard (see
-below). The remaining-time rows do not come from that snapshot either: they take
-the runtime's published `Remaining` and subtract the age of the status heartbeat
-(`Remaining - (now - LastTick)`, floored at zero), so the pane counts down with
-the overlay instead of showing a value up to a minute stale. `Cere PIN pentru
+below). The remaining-time rows normally take the runtime's published
+`Remaining` and subtract the age of the status heartbeat
+(`Remaining - (now - LastTick)`, floored at zero). That live value is used only
+while the runtime has a fresh heartbeat, is not inert, setup is complete and no
+parent pause is active; in every other case the pane falls back to the
+persisted cycle state: `Remaining` from the preferences file, or `0` while the
+tweak is disabled. When it applies, it counts down with the
+overlay instead of showing a value up to a minute stale. `Cere PIN pentru
 modificări` defaults to on, which makes every row that changes the cycle or the
 PIN ask for the PIN first; the test-overlay row never asks, because it changes
 nothing. `Reia restricțiile` is the way out of a parent pause: it clears the
@@ -125,11 +129,18 @@ pause immediately instead of waiting for it to expire.
 
 A fresh install is **inert but loaded**: the tweak is injected into SpringBoard,
 waits for the status heartbeat, and enforces nothing until setup is complete.
-The preferences file is created at load and holds exactly one key,
-`SetupComplete = 0`: no cycle state, no PIN, nothing locked, no overlay, and the
-Home/Siri suppression is never armed until setup finishes. A device that already
-has a cycle state from an earlier release is treated as set up (the flag is
-pinned to `YES` on first read), so upgrading does not re-run the wizard.
+The preferences file is created at load and the tweak writes only
+`SetupComplete = 0` before setup: the tweak itself keeps no cycle state, stores
+no PIN, locks nothing, shows no overlay and never arms the Home/Siri suppression
+until setup finishes. The pane is a separate writer and does not follow that
+rule: until a PIN exists there is no PIN gate, so a wizard cancelled after it
+started leaves the pane fully usable, and its rows can write `State`, the PIN
+fields and `RequirePIN` before setup. That is intentional for a fresh install —
+every restriction is gated on `SetupComplete`, so nothing is enforced while it
+is still `0`. A preferences file from an earlier release is treated as set up —
+`SetupComplete` is pinned to `YES` on first read — only when a PIN is stored, so
+upgrading does not re-run the wizard; a device that never stored a PIN still
+gets the first-run wizard.
 
 Setup runs from Settings → Usage Guard: the wizard opens the first time the pane
 is shown. The overlay's seven-tap parent panel is *not* a setup path — the
@@ -138,8 +149,8 @@ blocare`, and neither can happen before setup. The wizard asks for the PIN
 twice, then the usage and break durations, explains the emergency valve, and
 finishes by storing the PIN, both durations, `SetupComplete = YES` and
 `enabled = 1`. The usage clock is re-anchored at that moment, so no time is
-billed for the period before setup finished. Until then `SetupComplete = 0` is
-the only key the tweak has written.
+billed for the period before setup finished. Until then the only key the tweak
+itself has written is `SetupComplete = 0`.
 
 ## Settings ↔ runtime communication
 
@@ -160,8 +171,10 @@ Every writer reloads the file, changes only its own keys and merges them into
 what it just read, so the two processes cannot clobber each other's keys.
 
 **Status file** — `/var/mobile/Library/Preferences/org.usageguard.timer.status.plist`,
-written by the SpringBoard runtime immediately on any meaningful change and at
-least every 5 seconds. All keys are numbers except `Version`:
+written by the SpringBoard runtime immediately on any meaningful change and,
+when nothing meaningful changed, no more often than once every 2 seconds, so
+the heartbeat stays well inside the pane's 5-second freshness window. All keys
+are numbers except `Version`:
 
 ```
 RuntimePID  RuntimeStartedAt  LastTick  Enabled  SetupComplete  Phase
@@ -460,9 +473,11 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   reloads the state every second, so a PIN changed from the break overlay's
   parent panel is visible to it, but the authorization it already granted is not
   re-checked. What it does do is drop that authorization whenever the pane
-  disappears or Preferences.app leaves the foreground (resign-active or
-  background): reopening Settings always asks for the PIN again, and reaching
-  Home and coming back to a suspended Preferences.app does too.
+  disappears or Preferences.app resigns active or goes to the background, and
+  at that same moment it dismisses any editor alert that is open and discards
+  the pending edit. Reopening Settings therefore always asks for the PIN
+  again, reaching Home and coming back to a suspended Preferences.app does
+  too, and a half-finished edit cannot be completed later.
 * **SpringBoard only.** Nothing is injected into individual apps; the overlay
   is a SpringBoard-level window at `UIWindowLevelAlert + 1000` that is
   re-raised on every 1 Hz synchronisation while a break is running.

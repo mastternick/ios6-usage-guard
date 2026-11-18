@@ -26,8 +26,11 @@ static const long long kUGEmergencyNoCallSeconds = 15;
 static const long long kUGPersistIntervalSeconds = 60;
 
 /* The status file is a heartbeat: refresh it at least this often so the
- * Preferences pane can tell a live runtime from a dead one. */
-static const long long kUGStatusRefreshSeconds = 5;
+ * Preferences pane can tell a live runtime from a dead one. The pane's own
+ * freshness window (kUGStatusFreshnessSeconds, 5 s, in the preference bundle)
+ * is deliberately the wider of the two: writing every 2 s leaves room for a
+ * late 1 Hz tick without a live runtime ever looking dead. */
+static const long long kUGStatusRefreshSeconds = 2;
 
 /* Length of a Settings "test overlay" preview. */
 static const long long kUGTestOverlaySeconds = 5;
@@ -735,7 +738,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
  * changed, when it is older than kUGStatusRefreshSeconds, or when forced. The
  * signature deliberately leaves Remaining, OverrideRemaining and LastTick out:
  * they move every second, and rewriting the plist at 1 Hz would be pure churn
- * for a heartbeat the 5 s refresh already keeps fresh. A failed write is
+ * for a heartbeat the 2 s refresh already keeps fresh. A failed write is
  * logged once and otherwise ignored; the guard never depends on it.
  */
 - (void)writeStatusIfNeeded:(BOOL)forced
@@ -758,7 +761,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
     /* Deliberately no Remaining and no OverrideRemaining here: both move with
      * the clock and would otherwise rewrite the file at 1 Hz. With them
-     * excluded, a write happens when a real field changes or when the 5 s
+     * excluded, a write happens when a real field changes or when the 2 s
      * heartbeat is due, and LastTick below is refreshed on that write. */
     signature = [NSString stringWithFormat:
         @"%lld|%lld|%d|%d|%d|%d|%d|%d|%d|%d|%@",

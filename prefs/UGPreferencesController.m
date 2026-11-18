@@ -141,6 +141,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     NSTimer *_refreshTimer;
 
     NSInteger _alertCount;
+    UIAlertView *_activeAlert;
     void (^_resumeAfterNotice)(void);
 
     BOOL _authorized;
@@ -258,6 +259,21 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     _pendingAuthorizedAction = nil;
     _pendingPIN = nil;
     _wizardPIN = nil;
+
+    /* A presented editor outlives a background transition: dismiss it so it
+     * cannot re-open an unlocked editor once the PIN state is gone. The stored
+     * resume block goes with it. */
+    _resumeAfterNotice = nil;
+
+    UIAlertView *alert = _activeAlert;
+    _activeAlert = nil;
+    if (!alert) return;
+
+    [alert dismissWithClickedButtonIndex:alert.cancelButtonIndex animated:NO];
+
+    /* A wizard step that was on screen is gone with the alert: start the
+     * wizard over instead of resuming a half-finished step. */
+    if (_wizardStep != kUGWizardStepIdle) _wizardStep = kUGWizardStepIdle;
 }
 
 #pragma mark - Live refresh
@@ -357,10 +373,20 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 /* The status file is written every few seconds; the disk State can lag by the
  * persist throttle. Correct the published Remaining for the snapshot's age so
- * both rows show what the overlay is counting down right now. NO when the
+ * both rows show what the overlay is counting down right now. The correction is
+ * only trustworthy while a live, set-up runtime is publishing and nothing is
+ * pausing the cycle; otherwise the persisted State is the answer. NO when the
  * snapshot has no numbers for the phase the pane is displaying. */
 - (BOOL)liveRemainingSeconds:(long long *)seconds
 {
+    if (![_ipc runtimeIsLive]) return NO;
+    if (![_ipc setupComplete]) return NO;
+
+    NSNumber *inert = [_status objectForKey:@"Inert"];
+    if (inert && [inert boolValue]) return NO;
+
+    if (ug_override_remaining(&_state, UGNowSeconds()) != 0) return NO;
+
     NSNumber *phase = [_status objectForKey:@"Phase"];
     NSNumber *remaining = [_status objectForKey:@"Remaining"];
     NSNumber *tick = [_status objectForKey:@"LastTick"];
@@ -1008,6 +1034,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleLimitAlert:(UIAlertView *)alertView usage:(BOOL)usage
 {
+    /* The alert can outlive the authorization that opened it; a cleared PIN
+     * state must not let it write. */
+    if ([self authorizationRequired]) return;
+
     int minutes = 0;
     if (!UGParseMinutes([[alertView textFieldAtIndex:0] text], &minutes)) {
         [self showNotice:@"Introdu un număr între 1 și 240 de minute."
@@ -1060,6 +1090,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleNewPINAlert:(UIAlertView *)alertView
 {
+    if ([self authorizationRequired]) return;
+
     NSString *pin = [[alertView textFieldAtIndex:0] text];
     if (![UGPrefs isValidPIN:pin]) {
         [self showNotice:@"Codul trebuie să aibă 4–8 cifre."
@@ -1074,6 +1106,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleConfirmPINAlert:(UIAlertView *)alertView
 {
+    if ([self authorizationRequired]) return;
+
     NSString *pin = [[alertView textFieldAtIndex:0] text];
     if (![pin isEqualToString:_pendingPIN]) {
         _pendingPIN = nil;
@@ -1216,6 +1250,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleWizardAlert:(UIAlertView *)alertView
 {
+    /* The wizard was torn down (cancel or an authorization clear): a late
+     * dismissal must not continue it. */
+    if (_wizardStep == kUGWizardStepIdle) return;
+
     switch (alertView.tag) {
         case kUGAlertTagWizardWelcome:
             _wizardStep = kUGWizardStepPIN;
@@ -1291,7 +1329,20 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)finishWizard
 {
+    /* The finish alert can outlive the authorization that opened the wizard. */
+    if ([self authorizationRequired]) {
+        [self abortWizard];
+        return;
+    }
+
     _wizardStep = kUGWizardStepIdle;
+
+    /* An authorization clear drops the collected PIN; that is a clean cancel,
+     * not a failed save. */
+    if (_wizardPIN.length == 0) {
+        [self abortWizard];
+        return;
+    }
 
     if (![_ipc setPIN:_wizardPIN]) {
         [self showNotice:@"Codul PIN nu a putut fi salvat." title:@"Eroare"];
@@ -1322,6 +1373,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (void)presentAlert:(UIAlertView *)alert
 {
     alert.delegate = self;
+    _activeAlert = alert;
     _alertCount++;
     [alert show];
 }
@@ -1349,8 +1401,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     /* iOS 6 dismisses an alert this way when the app leaves the foreground and
      * may skip didDismiss. Both paths decrement, and the count is clamped, so
      * the refresh loop can never be wedged by a lost dismissal. */
-    (void)alertView;
     if (_alertCount > 0) _alertCount--;
+    if (alertView == _activeAlert) _activeAlert = nil;
     _resumeAfterNotice = nil;
     _pendingAuthorizedAction = nil;
 }
@@ -1358,6 +1410,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (void)alertView:(UIAlertView *)alertView didDismissWithButtonIndex:(NSInteger)buttonIndex
 {
     if (_alertCount > 0) _alertCount--;
+    if (alertView == _activeAlert) _activeAlert = nil;
 
     BOOL cancelled = (buttonIndex == alertView.cancelButtonIndex);
 
