@@ -6,11 +6,14 @@
 #import <objc/runtime.h>
 #import <stdint.h>
 #import <stdlib.h>
+#import <unistd.h>
 
 #import "UGGuardCore.h"
+#import "UGNotify.h"
 #import "UGOverlayWindow.h"
 #import "UGParentPanel.h"
 #import "UGPrefs.h"
+#import "UGVersion.h"
 
 static NSString *const kUGNotificationScreenBlanked = @"com.apple.springboard.hasBlankedScreen";
 static NSString *const kUGNotificationLockComplete = @"com.apple.springboard.lockcomplete";
@@ -21,6 +24,14 @@ static const long long kUGEmergencyNoCallSeconds = 15;
 
 /* At most one state write per minute unless something actually happened. */
 static const long long kUGPersistIntervalSeconds = 60;
+
+/* The status file is a heartbeat: refresh it at least this often so the
+ * Preferences pane can tell a live runtime from a dead one. */
+static const long long kUGStatusRefreshSeconds = 5;
+
+/* Length of a Settings "test overlay" preview. */
+static const long long kUGTestOverlaySeconds = 5;
+
 enum { kUGMaxHooks = 4 };
 
 /*
@@ -282,6 +293,11 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 }
 
 @interface UGRuntime () <UGOverlayControllerDelegate, UGParentPanelDelegate>
+- (void)handleSettingsChanged;
+- (void)beginTestOverlay;
+- (void)updateTestOverlayAt:(long long)now;
+- (void)endTestOverlay;
+- (void)writeStatusIfNeeded:(BOOL)forced;
 @end
 
 @implementation UGRuntime {
@@ -306,7 +322,18 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     NSString *_savedStateString;
     CTCallCenter *_callCenter;
 
-    BOOL _needsFirstRunWizard;
+    BOOL _setupComplete;
+
+    /* Status file: identity, last written signature and wall clock. */
+    long long _runtimePID;
+    long long _runtimeStartedAt;
+    NSString *_lastStatusSignature;
+    long long _lastStatusWriteWall;
+    BOOL _statusFailureLogged;
+
+    /* Settings preview: the real state machine is untouched by it. */
+    BOOL _testModeActive;
+    long long _testModeUntil;
 }
 
 + (instancetype)sharedRuntime
@@ -326,6 +353,10 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
     _prefs = [UGPrefs sharedPrefs];
     [_prefs loadState:&_state now:UGNowSeconds()];
+    _setupComplete = [_prefs setupComplete];
+
+    _runtimePID = (long long)getpid();
+    if (_runtimeStartedAt <= 0) _runtimeStartedAt = UGNowSeconds();
 
     /* Nothing about the device is assumed: both flags stay NO until a real
      * query says otherwise, so usage can never be credited at the lock screen
@@ -348,8 +379,11 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 /* Installs hooks, notifications and the window. Idempotent. */
 - (void)activate
 {
+    _setupComplete = [_prefs setupComplete];
+
     if (!_activated) {
         _activated = YES;
+        if (_runtimeStartedAt <= 0) _runtimeStartedAt = UGNowSeconds();
         [self refreshDeviceState];
         [self refreshCallActive];
         [self registerDarwinNotifications];
@@ -357,10 +391,11 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         [self ensureWindow];
     }
 
-    _needsFirstRunWizard = ![_prefs hasPIN];
-
+    /* A fresh install stays inert-but-loaded: nothing is persisted and nothing
+     * is locked until Settings (or the panel wizard) records a PIN. */
     [self syncUI];
-    [self persistIfChanged:YES];
+    if (_setupComplete) [self persistIfChanged:YES];
+    [self writeStatusIfNeeded:YES];
 }
 
 /*
@@ -378,6 +413,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         /* The inert interval is not credited to usage; a break keeps elapsing. */
         ug_state_startup(&_state, UGNowSeconds());
         [self activate];
+        [self writeStatusIfNeeded:YES];
         return NO;
     }
 
@@ -386,7 +422,6 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         sUGOverlayLocked = 0;
         _emergencyUntil = 0;
         _emergencyCallSeen = NO;
-        _needsFirstRunWizard = NO;
 
         if (_panelPresented) {
             _panelPresented = NO;
@@ -396,6 +431,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         [_window.overlayController updateLocked:NO remaining:0 duration:0];
         [_window setHidden:YES];
         UGLog(@"Usage Guard: disable marker present, tweak is inert");
+        [self writeStatusIfNeeded:YES];
     }
     return YES;
 }
@@ -422,19 +458,22 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     [self rebaseClockIfBecameActive:(wasScreenOn && wasUnlocked)];
 
     now = UGNowSeconds();
-    events = ug_tick(&_state, now, _screenOn ? 1 : 0, _unlocked ? 1 : 0);
+    /* Until setup is complete the clock is not ticked and nothing is persisted:
+     * a fresh install must not lock anything, and there is no agreement yet on
+     * durations to enforce. Device state and the status file stay live. */
+    events = _setupComplete
+        ? ug_tick(&_state, now, _screenOn ? 1 : 0, _unlocked ? 1 : 0)
+        : UGEventNone;
 
     [self syncUI];
     [self pushStateToPanel];
 
-    [self persistIfChanged:(events != UGEventNone ||
-                            _screenOn != wasScreenOn ||
-                            _unlocked != wasUnlocked)];
-
-    if (_needsFirstRunWizard && !_panelPresented && _screenOn && _unlocked) {
-        _needsFirstRunWizard = NO;
-        [self presentPanelWithSetup:YES];
+    if (_setupComplete) {
+        [self persistIfChanged:(events != UGEventNone ||
+                                _screenOn != wasScreenOn ||
+                                _unlocked != wasUnlocked)];
     }
+    [self writeStatusIfNeeded:NO];
 }
 
 /*
@@ -534,6 +573,37 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     }
 
     now = UGNowSeconds();
+
+    if (_testModeActive) {
+        if (_panelPresented) {
+            /* The panel needs the window; the preview must not fight it. */
+            [self endTestOverlay];
+        } else if (!(ug_is_locked(&_state, now) && _screenOn && _unlocked &&
+                     _emergencyUntil <= now && !_callActive)) {
+            /* Preview in progress: it owns the window and deliberately leaves
+             * sUGOverlayLocked alone, so Home and Siri keep working. */
+            [self ensureWindow];
+            [_window setHidden:NO];
+            _window.windowLevel = UIWindowLevelAlert + 1000.0f;
+            [self updateTestOverlayAt:now];
+            return;
+        } else {
+            /* A real break fell due during the preview: it wins outright. */
+            [self endTestOverlay];
+        }
+    }
+
+    /* Fresh install: no enforcement at all, and the overlay window stays down
+     * unless the parent panel itself is on screen. */
+    if (!_setupComplete) {
+        sUGOverlayLocked = 0;
+        if (_window) {
+            [_window.overlayController updateLocked:NO remaining:0 duration:0];
+            if (!_panelPresented) [_window setHidden:YES];
+        }
+        return;
+    }
+
     emergency = _emergencyUntil > now;
     locked = ug_is_locked(&_state, now) && _screenOn && _unlocked &&
              !emergency && !_callActive;
@@ -565,6 +635,168 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     if (_panelPresented && panel) [panel updateState:_state];
 }
 
+#pragma mark - Settings preview
+
+/*
+ * Five-second preview requested by the Preferences pane. It renders the real
+ * break screen with test copy, but hands nothing to the guard: the state
+ * machine, the persisted state and sUGOverlayLocked are all left untouched, so
+ * the child can still use Home and Siri and the preview expires by itself.
+ */
+- (void)beginTestOverlay
+{
+    long long now;
+
+    if (_inert || _panelPresented) return;
+    /* A real break is already on screen: the preview has nothing to add and
+     * must not replace the live countdown. */
+    if (ug_is_locked(&_state, UGNowSeconds()) && _screenOn && _unlocked) return;
+
+    [self ensureWindow];
+    now = UGNowSeconds();
+    _testModeActive = YES;
+    _testModeUntil = now + kUGTestOverlaySeconds;
+    [_window.overlayController setTestMode:YES];
+    [_window setHidden:NO];
+    _window.windowLevel = UIWindowLevelAlert + 1000.0f;
+    [self updateTestOverlayAt:now];
+}
+
+- (void)updateTestOverlayAt:(long long)now
+{
+    long long remaining = _testModeUntil - now;
+
+    if (remaining <= 0) {
+        [self endTestOverlay];
+        return;
+    }
+    [_window.overlayController updateLocked:YES
+                                 remaining:remaining
+                                  duration:kUGTestOverlaySeconds];
+}
+
+- (void)endTestOverlay
+{
+    if (!_testModeActive) return;
+
+    _testModeActive = NO;
+    _testModeUntil = 0;
+    if (!_window) return;
+
+    [_window.overlayController setTestMode:NO];
+    [_window.overlayController updateLocked:NO remaining:0 duration:0];
+    if (!_panelPresented) [_window setHidden:YES];
+}
+
+#pragma mark - Status file
+
+/*
+ * Heartbeat read by the Preferences pane. Written when something meaningful
+ * changed, when it is older than kUGStatusRefreshSeconds, or when forced. The
+ * signature deliberately leaves LastTick out: it moves every second, and
+ * rewriting the plist at 1 Hz would be pure churn for a heartbeat the 5 s
+ * refresh already keeps fresh. A failed write is logged once and otherwise
+ * ignored; the guard never depends on it.
+ */
+- (void)writeStatusIfNeeded:(BOOL)forced
+{
+    long long now;
+    long long overrideRemaining;
+    BOOL enabled;
+    BOOL killSwitch;
+    BOOL debugLogging;
+    NSDictionary *status;
+    NSString *signature;
+
+    if (!_prefs) return;
+
+    now = UGNowSeconds();
+    overrideRemaining = ug_override_remaining(&_state, now);
+    enabled = (_setupComplete && _state.enabled) ? YES : NO;
+    killSwitch = UGKillSwitchEngaged();
+    debugLogging = UGDebugLoggingEnabled();
+
+    signature = [NSString stringWithFormat:
+        @"%lld|%lld|%d|%d|%d|%lld|%d|%d|%lld|%d|%d|%d|%@",
+        _runtimePID,
+        _runtimeStartedAt,
+        enabled ? 1 : 0,
+        _setupComplete ? 1 : 0,
+        _state.phase,
+        _state.remaining,
+        _state.usageMinutes,
+        _state.breakMinutes,
+        overrideRemaining,
+        _inert ? 1 : 0,
+        killSwitch ? 1 : 0,
+        debugLogging ? 1 : 0,
+        @UG_VERSION];
+
+    if (!forced && _lastStatusWriteWall > 0 &&
+        [signature isEqualToString:_lastStatusSignature] &&
+        now >= _lastStatusWriteWall &&
+        now - _lastStatusWriteWall < kUGStatusRefreshSeconds) {
+        return;
+    }
+
+    status = @{
+        @"RuntimePID": @(_runtimePID),
+        @"RuntimeStartedAt": @(_runtimeStartedAt),
+        @"LastTick": @(now),
+        @"Enabled": @(enabled),
+        @"SetupComplete": @(_setupComplete),
+        @"Phase": @(_state.phase),
+        @"Remaining": @(_state.remaining),
+        @"UsageMinutes": @(_state.usageMinutes),
+        @"BreakMinutes": @(_state.breakMinutes),
+        @"OverrideRemaining": @(overrideRemaining),
+        @"Inert": @(_inert),
+        @"KillSwitch": @(killSwitch),
+        @"DebugLogging": @(debugLogging),
+        @"Version": @UG_VERSION
+    };
+
+    if (![status writeToFile:@UG_STATUS_PATH atomically:YES]) {
+        if (!_statusFailureLogged) {
+            _statusFailureLogged = YES;
+            UGLog(@"Usage Guard: could not write %@", @UG_STATUS_PATH);
+        }
+        return;
+    }
+
+    _statusFailureLogged = NO;
+    _lastStatusSignature = signature;
+    _lastStatusWriteWall = now;
+    notify_post([kUGNotifyStatusChanged UTF8String]);
+}
+
+#pragma mark - Settings reload
+
+/*
+ * The Preferences pane just wrote the plist. Adopt whatever it stored (State,
+ * SetupComplete, RequirePIN, durations) and repaint; a state that matches what
+ * is already persisted is not rewritten.
+ */
+- (void)handleSettingsChanged
+{
+    BOOL wasSetupComplete = _setupComplete;
+
+    [_prefs reloadFromDisk];
+    [_prefs loadState:&_state now:UGNowSeconds()];
+    _setupComplete = [_prefs setupComplete];
+
+    /* Enforcement only starts once setup is complete, so re-anchor the clock
+     * the moment it becomes true instead of billing the time before it. */
+    if (!wasSetupComplete && _setupComplete) {
+        ug_state_startup(&_state, UGNowSeconds());
+    }
+
+    [self syncUI];
+    [self pushStateToPanel];
+    if (_setupComplete) [self persistIfChanged:YES];
+    [self writeStatusIfNeeded:YES];
+}
+
 #pragma mark - Parent panel
 
 - (void)presentPanelWithSetup:(BOOL)requiresSetup
@@ -573,6 +805,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
     if (_panelPresented) return;
 
+    [self endTestOverlay];
     [self ensureWindow];
     [_window setHidden:NO];
     [_window.overlayController updateLocked:NO remaining:0 duration:0];
@@ -613,7 +846,18 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
 - (BOOL)panelStorePIN:(NSString *)pin
 {
-    return [_prefs setPIN:pin];
+    BOOL stored = [_prefs setPIN:pin];
+
+    /* The panel's own wizard is a valid first-run path: a stored PIN is what
+     * makes enforcement legal, so record setup completion with it. */
+    if (stored && !_setupComplete && [_prefs setSetupComplete:YES]) {
+        _setupComplete = YES;
+        ug_state_startup(&_state, UGNowSeconds());
+        [self persistIfChanged:YES];
+        [self syncUI];
+        [self writeStatusIfNeeded:YES];
+    }
+    return stored;
 }
 
 - (NSInteger)panelPINLockoutSeconds
@@ -624,7 +868,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 - (void)panelApplyState:(UGState)state
 {
     _state = state;
-    [self persistIfChanged:YES];
+    if (_setupComplete) [self persistIfChanged:YES];
     [self syncUI];
 }
 
@@ -639,6 +883,13 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 {
     (void)controller;
     [self presentPanelWithSetup:![_prefs hasPIN]];
+}
+
+- (void)overlayControllerDidRequestTestDismiss:(UGOverlayController *)controller
+{
+    (void)controller;
+    /* Nothing to undo: the preview never armed the guard or moved the state. */
+    [self endTestOverlay];
 }
 
 - (void)overlayControllerDidRequestEmergencyCall:(UGOverlayController *)controller
@@ -731,13 +982,25 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     BOOL wasScreenOn = _screenOn;
     BOOL wasUnlocked = _unlocked;
 
-    (void)name;
+    if ([name isEqualToString:kUGNotifySettingsChanged]) {
+        if ([self enterInertModeIfNeeded]) return;
+        [self handleSettingsChanged];
+        return;
+    }
+    if ([name isEqualToString:kUGNotifyTestOverlay]) {
+        if ([self enterInertModeIfNeeded]) return;
+        [self beginTestOverlay];
+        return;
+    }
+
     if ([self enterInertModeIfNeeded]) return;
 
     [self refreshDeviceState];
     [self rebaseClockIfBecameActive:(wasScreenOn && wasUnlocked)];
     if (!_unlocked && _panelPresented) [self dismissPanel];
-    [self persistIfChanged:(_screenOn != wasScreenOn || _unlocked != wasUnlocked)];
+    if (_setupComplete) {
+        [self persistIfChanged:(_screenOn != wasScreenOn || _unlocked != wasUnlocked)];
+    }
     [self syncUI];
 }
 
@@ -748,7 +1011,9 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
     NSArray *names = @[kUGNotificationScreenBlanked,
                        kUGNotificationLockComplete,
-                       kUGNotificationLockState];
+                       kUGNotificationLockState,
+                       kUGNotifySettingsChanged,
+                       kUGNotifyTestOverlay];
 
     for (NSString *name in names) {
         CFNotificationCenterAddObserver(center,

@@ -7,9 +7,10 @@ repeating **use / break** cycle:
 * then a mandatory 30-minute break with a full-screen lock overlay,
 * repeat indefinitely.
 
-Both durations are configurable from a PIN-protected parent panel. The tweak
-runs inside SpringBoard, so the break overlay appears above apps, the home
-screen, notifications and alerts regardless of what is in the foreground.
+Both durations are configurable from a PIN-protected parent panel and from the
+**Usage Guard** pane in Settings. The tweak runs inside SpringBoard, so the break
+overlay appears above apps, the home screen, notifications and alerts regardless
+of what is in the foreground.
 
 ## What it looks like
 
@@ -89,6 +90,112 @@ Clock rules on every tick:
   unlocking the phone never hands out the 2-second cap for time the phone was
   not in use. Usage therefore only counts while the screen is on and unlocked.
 
+## Settings pane
+
+The package also installs a preference bundle
+(`/Library/PreferenceBundles/UsageGuardPrefs.bundle`) plus a PreferenceLoader
+entry (`/Library/PreferenceLoader/Preferences/UsageGuard.plist`), so a
+**Usage Guard** row appears at the bottom of `Settings`. There is no app icon:
+the pane lives in Settings. The bundle is a plain grouped table view with five
+sections, top to bottom:
+
+| section | rows |
+| --- | --- |
+| **Status** | `Usage Guard activ` switch; `Stare` (current phase); `Utilizare rămasă`; `Pauză rămasă`; `Runtime: activ (pid N)` or `Runtime: nu este detectat` |
+| **Time Limits** | `Utilizare (minute)` and `Pauză (minute)`, 1–240 each, edited through a prompt |
+| **Actions** | `Începe pauza acum`, `Resetează ciclul`, `Pauză 15 min`, `Pauză 30 min`, `Pauză 60 min`, `Reia restricțiile`, `Testează ecranul de blocare` |
+| **Security** | `Schimbă codul PIN` (`Setează un cod PIN` when none is stored) and the `Cere PIN pentru modificări` switch |
+| **Information** | tweak version, runtime, bundle version, preferences path, status-file age, kill-switch state, `DebugLogging` state |
+
+The pane keeps no copy of the state: every read reloads the preferences file and
+every change is a read-modify-write that is announced to SpringBoard (see
+below), so the pane and the break overlay cannot disagree. `Cere PIN pentru
+modificări` defaults to on, which makes every row that changes the cycle or the
+PIN ask for the PIN first; the test-overlay row never asks, because it changes
+nothing. `Reia restricțiile` is the way out of a parent pause: it clears the
+pause immediately instead of waiting for it to expire.
+
+## First-run setup
+
+A fresh install is **inert but loaded**: the tweak is injected into SpringBoard,
+waits for the status heartbeat, and enforces nothing until setup is complete.
+No cycle state is persisted, nothing is locked, the overlay stays down and the
+Home/Siri suppression is never armed. A device that already has a preferences
+file from an earlier release is treated as set up (the flag is pinned on first
+read), so upgrading does not re-run the wizard.
+
+Setup runs either from Settings → Usage Guard (the wizard opens the first time
+the pane is shown) or from the overlay's seven-tap parent panel. It asks for the
+PIN twice, then the usage and break durations, explains the emergency valve, and
+finishes by storing the PIN, both durations, `SetupComplete = YES` and
+`enabled = 1`. The usage clock is re-anchored at that moment, so no time is
+billed for the period before setup finished. Until then nothing is written to
+the preferences file.
+
+## Settings ↔ runtime communication
+
+The pane and SpringBoard share the preferences file and one status file, and
+signal each other over three Darwin notification names (declared in
+`src/UGNotify.h`):
+
+| name | direction | meaning |
+| --- | --- | --- |
+| `org.usageguard.timer.settingschanged` | Settings → SpringBoard | the preferences plist changed on disk; the runtime reloads state, `SetupComplete` and `RequirePIN` and repaints |
+| `org.usageguard.timer.testoverlay` | Settings → SpringBoard | preview the break overlay for 5 seconds |
+| `org.usageguard.timer.statuschanged` | SpringBoard → Settings | the status file was rewritten |
+
+**Preferences file** — unchanged path,
+`/var/mobile/Library/Preferences/org.usageguard.timelock.plist`. It holds the
+cycle state, the PIN vault and two booleans: `SetupComplete` and `RequirePIN`.
+Every writer reloads the file, changes only its own keys and merges them into
+what it just read, so the two processes cannot clobber each other's keys.
+
+**Status file** — `/var/mobile/Library/Preferences/org.usageguard.timer.status.plist`,
+written by the SpringBoard runtime immediately on any meaningful change and at
+least every 5 seconds. All keys are numbers except `Version`:
+
+```
+RuntimePID  RuntimeStartedAt  LastTick  Enabled  SetupComplete  Phase
+Remaining  UsageMinutes  BreakMinutes  OverrideRemaining  Inert
+KillSwitch  DebugLogging  Version (string)
+```
+
+`Enabled` is the effective value (`SetupComplete` **and** the stored enabled
+flag), not the raw switch. `LastTick` is a wall-clock heartbeat: a status file
+whose `LastTick` is more than 5 seconds old, or a missing file, is the pane's
+"the dylib is not loaded" signal — SpringBoard either never injected the tweak
+or has been restarted since. That freshness window is the only liveness
+evidence the pane has; it never assumes the tweak is running.
+
+## Diagnostics
+
+`DebugLogging` (a boolean in the preferences plist) turns on a small number of
+`NSLog` lines — startup, hook count, corrupt state, PIN lockout — that appear
+after a respring. The Information section of the pane shows its state, along
+with the tweak version, the bundle version, the preferences path, the status
+file age and the kill-switch state, which is usually enough to tell "not
+installed" from "installed but inert".
+
+The status file is the first thing to read when something looks wrong: copy
+`/var/mobile/Library/Preferences/org.usageguard.timer.status.plist` off the
+device and open it with `plutil` or Xcode on the desktop. `RuntimePID` and
+`LastTick` answer "is the tweak running in this SpringBoard?", `Inert` and
+`KillSwitch` answer "is it deliberately doing nothing?", and `Phase`/`Remaining`
+answer "what does it think the cycle is doing?". A stale `LastTick` after a
+respring is expected until the new runtime writes its first snapshot.
+
+## Test overlay
+
+`Testează ecranul de blocare` (Actions) posts
+`org.usageguard.timer.testoverlay`. SpringBoard raises the real break window
+with test copy for **5 seconds** and dismisses it by itself. The preview is
+purely visual: it never arms the Home/Siri hooks, writes no state, and does not
+start, extend, shorten or end a break — the countdown it draws is the preview's
+own and goes away with it. It is refused while the parent panel is on screen or
+while the tweak is inert, and if a real break falls due during the preview the
+real overlay takes over. It also needs the runtime to be loaded: with a stale
+status file the button has nothing to talk to.
+
 ## Safety valve
 
 The break overlay always exposes **Apel de urgență 112**. Pressing it hides the
@@ -110,15 +217,25 @@ while a break is still active.
 ## Repository layout
 
 ```
-Makefile                Theos build (armv7, iOS 6.0 deployment target)
+Makefile                Theos build: the tweak plus the preference bundle
 control                 Debian package metadata
 UsageGuard.plist        MobileSubstrate filter (com.apple.springboard)
 Tweak.x                single SpringBoard bootstrap hook
+layout/Library/PreferenceLoader/Preferences/UsageGuard.plist
+                        PreferenceLoader entry (the Settings row)
+prefs/                  preference bundle sources and resources
+prefs/Resources/Info.plist  the bundle's Info.plist (staged into the bundle)
+prefs/UGPreferencesController.{h,m}  the grouped Settings pane
+prefs/UGSettingsIPC.{h,m}            plist access and Darwin announcements
 src/UGGuardCore.{h,c}   pure C cycle engine, serialization, MM:SS formatting
 src/UGPrefs.{h,m}       plist persistence + PBKDF2 PIN vault and rate limit
+src/UGNotify.h          the three Darwin notification names
+src/UGVersion.h         release string and the status-file path
 src/UGOverlayWindow.{h,m}  high-level window and break overlay UI
 src/UGParentPanel.{h,m}    PIN gate, first-run wizard, settings panel
 src/UGRuntime.{h,m}     clock, Darwin notifications, guarded swizzles, glue
+scripts/validate_deb.py static .deb validator used by CI
+scripts/selftest_validate_deb.py  synthetic packages for that validator
 tests/test_guard_core.c host tests for the C engine
 tests/run.sh            host test runner
 ```
@@ -132,12 +249,12 @@ uses no allocation and its serialized state is bounded well below 512 bytes.
 The supported path is the CI pipeline in `.github/workflows/build.yml`. It runs
 on every push to `main` and on manual `workflow_dispatch`, installs Theos with
 the iPhoneOS 6.1 SDK and a 32-bit-capable LLVM toolchain on a GitHub-hosted
-Ubuntu runner, builds the probe tweak first, then this tweak, statically
-validates both packages, and uploads:
+Ubuntu runner, builds the probe tweak first, then this tweak and its preference
+bundle, statically validates both packages, and uploads:
 
 | artifact | contents |
 | --- | --- |
-| `usage-guard-deb` | `org.usageguard.timer_1.0.1_iphoneos-arm.deb` — install this |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.2_iphoneos-arm.deb` — install this |
 | `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
 | `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
 
@@ -148,11 +265,25 @@ checkout with the GitHub CLI:
 gh run download --name usage-guard-deb
 ```
 
-Validation is enforced, not advisory: the pipeline fails unless the payload is
-a single-slice **armv7** `MH_DYLIB` with `LC_VERSION_MIN_IPHONEOS 6.0.0` and a
-code signature, `Architecture: iphoneos-arm`, `Depends:` containing
-`mobilesubstrate`, and exactly the dylib plus its filter plist under
-`Library/MobileSubstrate/DynamicLibraries/` naming `com.apple.springboard`.
+Validation is enforced, not advisory: before building, the pipeline fails unless
+`control`, the bundle's `Info.plist` (`prefs/Resources/Info.plist`, the file
+Theos stages into the bundle) and `src/UGVersion.h` all carry the same version.
+The validator then fails the package unless
+
+* the payload is exactly five files — the armv7 `MH_DYLIB` and its filter plist
+  under `Library/MobileSubstrate/DynamicLibraries/`, the armv7 `MH_BUNDLE`
+  `UsageGuardPrefs` and its `Info.plist` under
+  `Library/PreferenceBundles/UsageGuardPrefs.bundle/`, and the PreferenceLoader
+  entry `Library/PreferenceLoader/Preferences/UsageGuard.plist`;
+* the filter plist names `com.apple.springboard` and the PreferenceLoader plist
+  names the `UsageGuardPrefs` bundle;
+* both binaries are single-slice **armv7**, `LC_VERSION_MIN_IPHONEOS` 6.0.0 and
+  signed (`LC_CODE_SIGNATURE`);
+* `Architecture: iphoneos-arm` and `Depends:` list `mobilesubstrate` and
+  `preferenceloader`.
+
+The probe package keeps its own, dependency-free two-file payload (dylib plus
+filter plist); the validator checks each layout separately.
 
 ### Local build (optional, requires your own toolchain)
 
@@ -163,7 +294,7 @@ make package FINALPACKAGE=1
 ```
 
 The package is written to `packages/` as
-`org.usageguard.timer_1.0.1_iphoneos-arm.deb`. The tweak targets
+`org.usageguard.timer_1.0.2_iphoneos-arm.deb`. The tweak targets
 `iphone:clang:6.1:6.0`, `ARCHS = armv7` (iPhone 4S / iPad 2 class hardware).
 
 ### Host tests (no Theos, no device)
@@ -189,14 +320,22 @@ Copy the built `.deb` to the device and install it with dpkg, then respring or
 restart SpringBoard:
 
 ```sh
-scp packages/org.usageguard.timer_1.0.1_iphoneos-arm.deb root@DEVICE_IP:/var/root/
+scp packages/org.usageguard.timer_1.0.2_iphoneos-arm.deb root@DEVICE_IP:/var/root/
 ssh root@DEVICE_IP \
-  'dpkg -i /var/root/org.usageguard.timer_1.0.1_iphoneos-arm.deb && killall -9 SpringBoard'
+  'dpkg -i /var/root/org.usageguard.timer_1.0.2_iphoneos-arm.deb && killall -9 SpringBoard'
 ```
 
 A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'
-deb installer) works the same way. After installation the tweak starts with
-SpringBoard; there is no app icon and no settings bundle.
+deb installer) works the same way. The package installs the tweak
+(`/Library/MobileSubstrate/DynamicLibraries/UsageGuard.dylib` and its filter
+plist), the preference bundle
+(`/Library/PreferenceBundles/UsageGuardPrefs.bundle/`) and the PreferenceLoader
+entry (`/Library/PreferenceLoader/Preferences/UsageGuard.plist`), and it
+declares `Depends: mobilesubstrate, preferenceloader, firmware (>= 6.0)`. Cydia
+and dpkg refuse the install without PreferenceLoader, which is what puts the
+pane in Settings. After installation the tweak starts with SpringBoard; there is
+no app icon — the pane lives in Settings → Usage Guard, and until the first-run
+setup is completed nothing is enforced.
 
 To remove it: `dpkg -r org.usageguard.timer` (or `dpkg -P`) followed by a
 respring. The preferences file `org.usageguard.timelock.plist` lives in the
@@ -217,6 +356,8 @@ methods (or, if they were already installed, they simply call the original), no
 usage accounting and no PIN wizard. The check runs on every 1 Hz tick, so the
 device is usable about a second after the file appears — no respring needed.
 The marker is only ever read, never created, modified or deleted by the tweak.
+The `Kill switch` row in the Settings pane's Information section shows whether
+the marker is currently seen, so its state is visible without a shell.
 
 Remove the file and respring to re-enable it (a running runtime also picks the
 removal up within a second):
@@ -240,6 +381,11 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   then reinstall and run the first-run wizard.
 * **Panel does not open from the title.** The gesture needs seven taps within
   three seconds while the break overlay is visible.
+* **No Usage Guard row in Settings.** PreferenceLoader is a declared dependency
+  (`Depends: ... preferenceloader ...`); reinstall the package so dpkg pulls it
+  in, then respring. If the row is there but the Status section reports no live
+  runtime, SpringBoard has not injected the tweak or was restarted since — see
+  Diagnostics above.
 
 ## Limitations (honest list)
 
@@ -273,6 +419,25 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   including across a respring or reboot.
 * **Break while disabled.** Disabling the tweak freezes the cycle, including a
   running break; re-enabling resumes it.
+* **Settings writes are last-write-wins.** The pane and SpringBoard both
+  read-modify-write the preferences plist and merge only the keys they changed,
+  but whoever writes last wins for those keys. Changing the same setting from
+  the break overlay's parent panel and from Settings at the same moment does not
+  merge somewhere in the middle: the later save is the one that survives. The
+  open pane reloads the file once a second, so it does pick up changes made
+  elsewhere, it just cannot arbitrate between two saves of the same value.
+* **The status file is a heartbeat, not a log.** It is written by SpringBoard,
+  so when SpringBoard is killed it keeps its last contents: `RuntimePID`,
+  `LastTick` and `KillSwitch` are stale by design until the next SpringBoard
+  writes them. A `LastTick` older than 5 seconds means "no live runtime", never
+  "no tweak installed". Nothing enforces anything from that file; deleting it
+  only empties the pane's Information section until the next write.
+* **The pane cannot verify a PIN change made while it is open.** The pane
+  reloads the state every second, but the authorization it granted itself stays
+  in memory until the view goes away. If the PIN is changed from the break
+  overlay's parent panel while Settings is already open, edits from that open
+  pane are not re-prompted. Closing and reopening Settings restores the PIN
+  prompt.
 * **SpringBoard only.** Nothing is injected into individual apps; the overlay
   is a SpringBoard-level window at `UIWindowLevelAlert + 1000` that is
   re-raised on every 1 Hz synchronisation while a break is running.
@@ -286,7 +451,10 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   `lockstate` fires on both lock and unlock. When no source can answer, the
   tweak assumes "locked, screen off": it neither counts usage nor covers the
   screen on a guess. No private method ABI is assumed at compile time.
-* **No on-device test in this repository.** CI builds the package and runs the
-  host C tests; runtime behaviour must be smoke-tested on a real jailbroken
-  iOS 6.1.3 device (respring, overlay over several apps, lock/unlock, emergency
-  call, PIN lockout).
+* **No physical-device test was performed for this release.** CI cross-builds
+  the package, `scripts/validate_deb.py` checks the payload statically and the
+  host C tests cover the cycle engine; nothing in this repository exercises the
+  Settings pane, the status file, the Darwin notifications or the overlay on
+  hardware. Runtime behaviour must be smoke-tested on a real jailbroken iOS
+  6.1.3 device: respring, overlay over several apps, lock/unlock, the emergency
+  call, PIN lockout, a Settings round-trip and the test overlay.

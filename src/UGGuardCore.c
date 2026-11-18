@@ -173,6 +173,17 @@ void ug_pause(UGState *state, long long now, int minutes)
     state->lastWall = now;
 }
 
+void ug_resume(UGState *state, long long now)
+{
+    /* `now` is part of the parent-action signature but a resume needs no
+     * re-anchoring: the next tick credits at most UG_MAX_CREDIT_SECONDS of the
+     * frozen gap, and ug_tick already forgot a backward clock jump. */
+    (void)now;
+    if (!state) return;
+    if (state->overrideUntil <= 0) return;
+    state->overrideUntil = 0;
+}
+
 void ug_set_enabled(UGState *state, int enabled, long long now)
 {
     if (!state) return;

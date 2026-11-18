@@ -28,6 +28,12 @@ VALIDATOR = os.path.join(HERE, "validate_deb.py")
 
 DYLIB_DIR = "Library/MobileSubstrate/DynamicLibraries"
 
+# Mirrors validate_deb.py's MAIN_PAYLOAD_FILES; the self-test imports nothing.
+MAIN_DYLIB = "UsageGuard"
+PREFERENCE_BUNDLE = "UsageGuardPrefs"
+BUNDLE_DIR = "Library/PreferenceBundles/%s.bundle" % PREFERENCE_BUNDLE
+PREFERENCES_DIR = "Library/PreferenceLoader/Preferences"
+
 CONTROL_TEMPLATE = """Package: {package}
 Name: Synthetic
 Version: 0.0.1
@@ -54,26 +60,67 @@ FILTER_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 """
 
+INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>CFBundleDevelopmentRegion</key>
+\t<string>English</string>
+\t<key>CFBundleExecutable</key>
+\t<string>UsageGuardPrefs</string>
+\t<key>CFBundleIdentifier</key>
+\t<string>org.usageguard.timer.prefs</string>
+\t<key>CFBundlePackageType</key>
+\t<string>BNDL</string>
+\t<key>CFBundleShortVersionString</key>
+\t<string>1.0.2</string>
+</dict>
+</plist>
+"""
+
+PREFERENCES_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>entry</key>
+\t<dict>
+\t\t<key>bundle</key>
+\t\t<string>UsageGuardPrefs</string>
+\t\t<key>cell</key>
+\t\t<string>PSLinkCell</string>
+\t</dict>
+</dict>
+</plist>
+"""
+
 
 # --------------------------------------------------------------------------- #
 # Synthetic Mach-O
 # --------------------------------------------------------------------------- #
 
 def macho(cputype=12, cpusubtype=9, filetype=6, min_os=(6, 0, 0),
-          install_base="Synthetic", code_signature=True, fat=False, fat_slices=2):
-    """Build a minimal thin Mach-O dylib (or a fat wrapper when fat=True)."""
-    install_name = "/%s/%s.dylib" % (DYLIB_DIR, install_base)
-    name_bytes = install_name.encode("utf-8") + b"\x00"
-    name_bytes += b"\x00" * ((4 - len(name_bytes) % 4) % 4)
+          install_base="Synthetic", code_signature=True, fat=False, fat_slices=2,
+          id_dylib=True):
+    """Build a minimal thin Mach-O dylib (or a fat wrapper when fat=True).
 
-    dylib_cmd = struct.pack("<IIIIII", 0x0D, 24 + len(name_bytes), 24, 0, 0x10000, 0x10000) + name_bytes
+    ``filetype=8`` together with ``id_dylib=False`` yields an MH_BUNDLE, i.e.
+    the preference bundle binary: a bundle has no LC_ID_DYLIB.
+    """
+    commands = b""
+    ncmds = 0
+    if id_dylib:
+        install_name = "/%s/%s.dylib" % (DYLIB_DIR, install_base)
+        name_bytes = install_name.encode("utf-8") + b"\x00"
+        name_bytes += b"\x00" * ((4 - len(name_bytes) % 4) % 4)
+        commands += struct.pack("<IIIIII", 0x0D, 24 + len(name_bytes), 24, 0, 0x10000, 0x10000) + name_bytes
+        ncmds += 1
     version = (min_os[0] << 16) | (min_os[1] << 8) | min_os[2]
-    version_cmd = struct.pack("<IIII", 0x25, 16, version, (6 << 16) | (1 << 8) | 3)
-    commands = dylib_cmd + version_cmd
+    commands += struct.pack("<IIII", 0x25, 16, version, (6 << 16) | (1 << 8) | 3)
+    ncmds += 1
     if code_signature:
         commands += struct.pack("<IIII", 0x1D, 16, 0, 16)
+        ncmds += 1
 
-    ncmds = 2 + (1 if code_signature else 0)
     header = struct.pack("<IIIIIII", 0xFEEDFACE, cputype, cpusubtype, filetype,
                          ncmds, len(commands), 0)
     thin = header + commands + b"\x00" * 32
@@ -107,8 +154,13 @@ def tar_bytes(entries, with_dirs=False):
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
         if with_dirs:
-            for name in (".", "./Library", "./Library/MobileSubstrate",
-                         "./Library/MobileSubstrate/DynamicLibraries"):
+            # dpkg/GNU tar emit the archive root plus one entry per parent dir.
+            directories = {}
+            for name, _ in entries:
+                parts = name.split("/")[:-1]
+                for depth in range(1, len(parts) + 1):
+                    directories["./" + "/".join(parts[:depth])] = True
+            for name in ["."] + list(directories):
                 info = tarfile.TarInfo(name)
                 info.type = tarfile.DIRTYPE
                 info.mode = 0o755
@@ -184,6 +236,35 @@ GOOD_ENTRIES = [
     ("%s/Synthetic.plist" % DYLIB_DIR, FILTER_PLIST.encode()),
 ]
 
+# The probe package: dependency-free, two-file payload, identified by its id.
+PROBE_CONTROL = CONTROL_TEMPLATE.format(
+    package="org.usageguard.probe",
+    architecture="iphoneos-arm",
+    depends="mobilesubstrate, firmware (>= 6.0)",
+)
+
+# The main package: same tweak plus the Settings preference bundle.
+MAIN_CONTROL = CONTROL_TEMPLATE.format(
+    package="org.usageguard.timer",
+    architecture="iphoneos-arm",
+    depends="mobilesubstrate, preferenceloader, firmware (>= 6.0)",
+)
+
+MAIN_ENTRIES = [
+    ("%s/%s.dylib" % (DYLIB_DIR, MAIN_DYLIB), macho(install_base=MAIN_DYLIB)),
+    ("%s/%s.plist" % (DYLIB_DIR, MAIN_DYLIB), FILTER_PLIST.encode()),
+    ("%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE), macho(filetype=8, id_dylib=False)),
+    ("%s/Info.plist" % BUNDLE_DIR, INFO_PLIST.encode()),
+    ("%s/%s.plist" % (PREFERENCES_DIR, MAIN_DYLIB), PREFERENCES_PLIST.encode()),
+]
+
+BUNDLE_BINARY_KEY = "%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE)
+
+
+def with_entry(entries, path, payload):
+    """Return entries with the payload of ``path`` replaced."""
+    return [(name, payload if name == path else data) for name, data in entries]
+
 
 # --------------------------------------------------------------------------- #
 # Cases
@@ -203,6 +284,30 @@ def cases(tmpdir):
     good_fat1 = deb("good-single-slice-fat", [(GOOD_ENTRIES[0][0], macho(fat=True, fat_slices=1)),
                                               GOOD_ENTRIES[1]])
     good_dmpl = make_deb_dmpl(os.path.join(tmpdir, "good-dmpl-default.deb"), GOOD_ENTRIES, GOOD_CONTROL)
+
+    # Probe layout: identified by package id, dependency-free, two files.
+    good_probe = deb("good-probe-layout", GOOD_ENTRIES, control=PROBE_CONTROL)
+
+    # Main layout: the five-file payload including the preference bundle.
+    good_main = deb("good-main-layout", MAIN_ENTRIES, control=MAIN_CONTROL, with_dirs=True)
+    main_extra_bundle_file = deb("bad-main-extra-bundle-file",
+                                 MAIN_ENTRIES + [("%s/Extra.strings" % BUNDLE_DIR, b"/* x */\n")],
+                                 control=MAIN_CONTROL)
+    main_probe_payload = deb("bad-main-two-file-payload", GOOD_ENTRIES, control=MAIN_CONTROL)
+    main_bundle_arm64 = deb("bad-main-bundle-arm64",
+                            with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                       macho(cputype=22, cpusubtype=2, filetype=8, id_dylib=False)),
+                            control=MAIN_CONTROL)
+    main_bundle_unsigned = deb("bad-main-bundle-unsigned",
+                               with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                          macho(filetype=8, id_dylib=False, code_signature=False)),
+                               control=MAIN_CONTROL)
+    main_bad_prefs_plist = deb("bad-main-prefs-plist",
+                               with_entry(MAIN_ENTRIES, "%s/%s.plist" % (PREFERENCES_DIR, MAIN_DYLIB),
+                                          PREFERENCES_PLIST.replace(PREFERENCE_BUNDLE, "OtherPrefs").encode()),
+                               control=MAIN_CONTROL)
+    main_no_preferenceloader = deb("bad-main-no-preferenceloader", MAIN_ENTRIES,
+                                   control=MAIN_CONTROL.replace("preferenceloader, ", ""))
 
     wrong_arch = deb("bad-arch-arm64", [(GOOD_ENTRIES[0][0], macho(cputype=22, cpusubtype=2)),
                                         GOOD_ENTRIES[1]])
@@ -256,6 +361,23 @@ def cases(tmpdir):
         ("valid package (dpkg-style dir entries)", good_dirs, 0, "PASS", []),
         ("valid package (single-slice fat armv7)", good_fat1, 0, "single-slice fat", []),
         ("valid package (dm.pl control.gz + data.lzma)", good_dmpl, 0, "PASS", []),
+        ("main layout with the full five-file payload accepted", good_main, 0, "5 files", []),
+        ("probe layout accepted for the probe package", good_probe, 0,
+         "MobileSubstrate dylib + filter plist", []),
+        ("probe layout accepted with --expect-package probe", good_probe, 0,
+         "MobileSubstrate dylib + filter plist", ["--expect-package", "org.usageguard.probe"]),
+        ("extra file inside the preference bundle rejected", main_extra_bundle_file, 1,
+         "unexpected: %s/Extra.strings" % BUNDLE_DIR, []),
+        ("main package with a two-file payload rejected", main_probe_payload, 1,
+         "unexpected: %s/Synthetic.dylib" % DYLIB_DIR, []),
+        ("arm64 bundle binary rejected", main_bundle_arm64, 1,
+         "bundle binary is armv7 MH_BUNDLE", []),
+        ("unsigned bundle binary rejected", main_bundle_unsigned, 1,
+         "bundle LC_CODE_SIGNATURE", []),
+        ("PreferenceLoader plist naming the wrong bundle rejected", main_bad_prefs_plist, 1,
+         "PreferenceLoader plist names UsageGuardPrefs", []),
+        ("main package missing preferenceloader rejected", main_no_preferenceloader, 1,
+         "control: Depends preferenceloader", []),
         ("arm64 slice rejected", wrong_arch, 1, "CPU_TYPE_ARM", []),
         ("armv7s subtype rejected", armv7s, 1, "CPU_SUBTYPE_ARM_V7", []),
         ("fat binary rejected", fat, 1, "universal (fat) Mach-O", []),

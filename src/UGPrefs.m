@@ -26,6 +26,8 @@ static NSString *const kUGPINIterationsKey = @"PINIterations";
 static NSString *const kUGPINFailuresKey = @"PINFailures";
 static NSString *const kUGPINLockoutKey = @"PINLockoutUntil";
 static NSString *const kUGDebugKey = @"DebugLogging";
+static NSString *const kUGSetupCompleteKey = @"SetupComplete";
+static NSString *const kUGRequirePINKey = @"RequirePIN";
 
 /* Well above the 20 000 iteration floor; stored so it can be raised later. */
 static const uint32_t kUGPINIterations = 25000;
@@ -164,6 +166,8 @@ BOOL UGDebugLoggingEnabled(void)
 }
 
 @interface UGPrefs ()
+- (void)loadValuesFromDisk;
+- (BOOL)writeValuesApplying:(NSDictionary *)changes;
 - (void)clampLockoutWindow;
 - (NSDictionary *)PINFieldsWithSalt:(NSData *)salt
                                hash:(NSData *)hash
@@ -181,6 +185,9 @@ BOOL UGDebugLoggingEnabled(void)
     uint32_t _iterations;
     NSInteger _failures;
     long long _lockoutUntil;
+    /* Captured once, at process load: the SetupComplete migration needs to
+     * tell an upgraded install from a fresh one even after the first write. */
+    BOOL _fileExisted;
 }
 
 + (instancetype)sharedPrefs
@@ -196,40 +203,63 @@ BOOL UGDebugLoggingEnabled(void)
     self = [super init];
     if (!self) return nil;
 
+    _fileExisted = [[NSFileManager defaultManager] fileExistsAtPath:kUGPrefsPath];
+    [self loadValuesFromDisk];
+    return self;
+}
+
+- (void)reloadFromDisk
+{
+    [self loadValuesFromDisk];
+}
+
+/* Single reader for both -init and -reloadFromDisk: the plist on disk is the
+ * only authority, so a write by another process is picked up whole. */
+- (void)loadValuesFromDisk
+{
     NSDictionary *stored = [NSDictionary dictionaryWithContentsOfFile:kUGPrefsPath];
+    NSData *salt = nil;
+    NSData *hash = nil;
+    uint32_t iterations = 0;
+    NSInteger failures = 0;
+    long long lockoutUntil = 0;
+
     _values = stored ? [stored mutableCopy] : [NSMutableDictionary dictionary];
 
     if ([_values[kUGPINSaltKey] isKindOfClass:[NSString class]]) {
-        _salt = UGBase64Decode(_values[kUGPINSaltKey]);
+        salt = UGBase64Decode(_values[kUGPINSaltKey]);
     }
     if ([_values[kUGPINHashKey] isKindOfClass:[NSString class]]) {
-        _hash = UGBase64Decode(_values[kUGPINHashKey]);
+        hash = UGBase64Decode(_values[kUGPINHashKey]);
     }
     {
         long long number;
 
-        _iterations = 0;
         if (UGReadNumber(_values, kUGPINIterationsKey, &number) &&
             number > 0 && number <= (long long)UINT32_MAX) {
-            _iterations = (uint32_t)number;
+            iterations = (uint32_t)number;
         }
 
-        _failures = 0;
         if (UGReadNumber(_values, kUGPINFailuresKey, &number) && number > 0) {
-            _failures = (number > 1000) ? 1000 : (NSInteger)number;
+            failures = (number > 1000) ? 1000 : (NSInteger)number;
         }
 
-        _lockoutUntil = 0;
         if (UGReadNumber(_values, kUGPINLockoutKey, &number)) {
-            _lockoutUntil = number;
+            lockoutUntil = number;
         }
 
+        sUGDebugLogging = NO;
         if (UGReadNumber(_values, kUGDebugKey, &number)) {
             sUGDebugLogging = number != 0;
         }
     }
+
+    _salt = salt;
+    _hash = hash;
+    _iterations = iterations;
+    _failures = failures;
+    _lockoutUntil = lockoutUntil;
     [self clampLockoutWindow];
-    return self;
 }
 
 /* The lockout is a wall-clock deadline and the clock can move. Never trust it
@@ -245,18 +275,40 @@ BOOL UGDebugLoggingEnabled(void)
     }
 }
 
-- (BOOL)writeValues
+/*
+ * Read-modify-write: re-reads the file, applies only `changes` on top of it and
+ * writes the result atomically. A PIN stored from Preferences.app and a state
+ * save from SpringBoard therefore never clobber each other's keys. The merged
+ * dictionary becomes the in-memory cache, so a failed write never leaves the
+ * cache claiming something the file does not hold.
+ */
+- (BOOL)writeValuesApplying:(NSDictionary *)changes
 {
     NSString *directory = [kUGPrefsPath stringByDeletingLastPathComponent];
+    NSDictionary *onDisk = [NSDictionary dictionaryWithContentsOfFile:kUGPrefsPath];
+    NSMutableDictionary *merged;
     BOOL written;
+
+    if (onDisk) {
+        merged = [onDisk mutableCopy];
+    } else {
+        /* Unreadable or absent file: keep what this process already knows
+         * (notably the PIN vault) instead of dropping it. */
+        merged = [_values mutableCopy];
+    }
+    [merged addEntriesFromDictionary:changes];
 
     [[NSFileManager defaultManager] createDirectoryAtPath:directory
                              withIntermediateDirectories:YES
                                               attributes:nil
                                                    error:NULL];
-    written = [_values writeToFile:kUGPrefsPath atomically:YES];
-    if (!written) UGLog(@"Usage Guard: could not write %@", kUGPrefsPath);
-    return written;
+    written = [merged writeToFile:kUGPrefsPath atomically:YES];
+    if (!written) {
+        UGLog(@"Usage Guard: could not write %@", kUGPrefsPath);
+        return NO;
+    }
+    _values = merged;
+    return YES;
 }
 
 - (void)loadState:(UGState *)state now:(long long)now
@@ -286,8 +338,43 @@ BOOL UGDebugLoggingEnabled(void)
     length = ug_serialize(state, buffer, sizeof buffer);
     if (length == 0) return NO;
 
-    _values[kUGStateKey] = [NSString stringWithUTF8String:buffer];
-    return [self writeValues];
+    /* Only the State key: every other key written by Preferences.app stays. */
+    return [self writeValuesApplying:
+        @{kUGStateKey: [NSString stringWithUTF8String:buffer]}];
+}
+
+- (BOOL)setupComplete
+{
+    long long number;
+
+    /* A migrated install must not look unfinished, and a fresh install must not
+     * look finished on the next launch: both answers are pinned into the file
+     * the first time it is asked. */
+    if (UGReadNumber(_values, kUGSetupCompleteKey, &number)) return number != 0;
+    if (_fileExisted) {
+        [self setSetupComplete:YES];
+        return YES;
+    }
+    [self setSetupComplete:NO];
+    return NO;
+}
+
+- (BOOL)setSetupComplete:(BOOL)value
+{
+    return [self writeValuesApplying:@{kUGSetupCompleteKey: @(value ? 1 : 0)}];
+}
+
+- (BOOL)requirePIN
+{
+    long long number;
+
+    if (!UGReadNumber(_values, kUGRequirePINKey, &number)) return YES;
+    return number != 0;
+}
+
+- (BOOL)setRequirePIN:(BOOL)value
+{
+    return [self writeValuesApplying:@{kUGRequirePINKey: @(value ? 1 : 0)}];
 }
 
 - (BOOL)hasPIN
@@ -331,33 +418,11 @@ BOOL UGDebugLoggingEnabled(void)
     };
 }
 
-/* Persists the given PIN entries. A failed write restores the previous entries,
- * so the file on disk and the values in memory never disagree. */
+/* Persists the given PIN entries. The merge writer touches only these keys, so a
+ * cycle-state write racing with this one cannot undo it. */
 - (BOOL)commitPINFields:(NSDictionary *)fields
 {
-    NSArray *keys = @[kUGPINSaltKey, kUGPINHashKey, kUGPINIterationsKey,
-                      kUGPINFailuresKey, kUGPINLockoutKey];
-    NSMutableDictionary *previous = [NSMutableDictionary dictionary];
-    BOOL written;
-
-    for (NSString *key in keys) {
-        id value = _values[key];
-        previous[key] = value ? value : (id)[NSNull null];
-    }
-
-    [_values addEntriesFromDictionary:fields];
-    written = [self writeValues];
-    if (!written) {
-        for (NSString *key in keys) {
-            id value = previous[key];
-            if (value == [NSNull null]) {
-                [_values removeObjectForKey:key];
-            } else {
-                _values[key] = value;
-            }
-        }
-    }
-    return written;
+    return [self writeValuesApplying:fields];
 }
 
 - (BOOL)persistPINFields

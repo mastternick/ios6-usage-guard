@@ -10,3 +10,8 @@ UsageGuard_CFLAGS = -fobjc-arc
 UsageGuard_FRAMEWORKS = UIKit Foundation Security CoreTelephony CoreGraphics QuartzCore
 
 include $(THEOS)/makefiles/tweak.mk
+
+# Settings pane (Library/PreferenceBundles/UsageGuardPrefs.bundle). Its sources
+# and its PreferenceLoader entry plist (layout/) are staged into the same deb.
+SUBPROJECTS += prefs
+include $(THEOS_MAKE_PATH)/aggregate.mk

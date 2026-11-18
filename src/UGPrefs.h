@@ -9,6 +9,10 @@
  * stored as the core's serialized string; the PIN is stored as a PBKDF2 hash
  * with a random salt and an explicit iteration count. No plaintext PIN is ever
  * written, logged or kept after verification.
+ *
+ * Every write is a read-modify-write of that dictionary: only the keys being
+ * changed are replaced, so SpringBoard and the Preferences pane can persist at
+ * the same time without dropping each other's keys.
  */
 
 @interface UGPrefs : NSObject
@@ -21,6 +25,23 @@
 
 /* Atomically persists the whole cycle state. Returns NO when the write fails. */
 - (BOOL)saveState:(const UGState *)state;
+
+/* Re-reads the plist from disk, adopting keys another process wrote (the
+ * Preferences pane, a second wizard instance). PIN vault fields, the lockout
+ * window and the debug flag are refreshed with it. */
+- (void)reloadFromDisk;
+
+/*
+ * Setup gate. YES once a PIN has been configured. An install that predates the
+ * key (plist present, key absent) is migrated to YES; a fresh install is pinned
+ * to NO so a later launch cannot mistake it for a configured one.
+ */
+- (BOOL)setupComplete;
+- (BOOL)setSetupComplete:(BOOL)value;
+
+/* Whether the parent panel demands a PIN. Defaults to YES. */
+- (BOOL)requirePIN;
+- (BOOL)setRequirePIN:(BOOL)value;
 
 - (BOOL)hasPIN;
 + (BOOL)isValidPIN:(NSString *)pin;

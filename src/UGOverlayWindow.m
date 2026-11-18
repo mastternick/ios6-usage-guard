@@ -20,10 +20,12 @@ static const NSInteger kUGParentTapCount = 7;
     CAShapeLayer *_ringProgress;
     UILabel *_countdownLabel;
     UIButton *_emergencyButton;
+    UIButton *_dismissButton;
     NSString *_notice;
     long long _remaining;
     NSInteger _titleTapCount;
     NSTimeInterval _firstTitleTapTime;
+    BOOL _testMode;
 }
 
 - (void)loadView
@@ -140,6 +142,22 @@ static const NSInteger kUGParentTapCount = 7;
                forControlEvents:UIControlEventTouchUpInside];
     [_contentView addSubview:_emergencyButton];
 
+    /* Shares the emergency button's slot: the two are never visible together,
+     * so the 320x480 layout has no extra element to fit. 240x50 keeps the
+     * touch target above 44 pt. */
+    _dismissButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    _dismissButton.frame = _emergencyButton.frame;
+    _dismissButton.backgroundColor = accentColor;
+    _dismissButton.layer.cornerRadius = 25.0f;
+    _dismissButton.titleLabel.font = [UIFont boldSystemFontOfSize:17.0f];
+    [_dismissButton setTitle:@"Închide" forState:UIControlStateNormal];
+    [_dismissButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [_dismissButton addTarget:self
+                       action:@selector(handleDismissTap:)
+             forControlEvents:UIControlEventTouchUpInside];
+    _dismissButton.hidden = YES;
+    [_contentView addSubview:_dismissButton];
+
     _contentView.hidden = YES;
 }
 
@@ -174,6 +192,12 @@ static const NSInteger kUGParentTapCount = 7;
 {
     long long minutes;
 
+    if (_testMode) {
+        _subtitleLabel.text =
+            @"Ecranul de pauză arată așa. Se închide automat în 5 secunde.";
+        return;
+    }
+
     if (_notice.length > 0) {
         _subtitleLabel.text = _notice;
         return;
@@ -183,6 +207,27 @@ static const NSInteger kUGParentTapCount = 7;
     if (minutes < 1) minutes = 1;
     _subtitleLabel.text = [NSString stringWithFormat:
         @"Mai ai %ld minute până poți folosi telefonul.", (long)minutes];
+}
+
+- (void)setTestMode:(BOOL)testMode
+{
+    if (![self isViewLoaded]) [self view];
+
+    _testMode = testMode;
+    if (testMode) {
+        _notice = nil;
+        _contentView.hidden = NO;
+        _titleLabel.text = @"Mod de test";
+        /* A preview must not be able to dial 112: the emergency valve is
+         * replaced by the dismiss button for as long as the preview lasts. */
+        _emergencyButton.hidden = YES;
+        _dismissButton.hidden = NO;
+    } else {
+        _titleLabel.text = @"Pauză de la telefon!";
+        _emergencyButton.hidden = NO;
+        _dismissButton.hidden = YES;
+    }
+    [self refreshSubtitle];
 }
 
 - (void)showNotice:(NSString *)notice
@@ -253,6 +298,12 @@ static const NSInteger kUGParentTapCount = 7;
 - (void)handleEmergencyTap:(id)sender
 {
     [self.delegate overlayControllerDidRequestEmergencyCall:self];
+}
+
+- (void)handleDismissTap:(id)sender
+{
+    (void)sender;
+    [self.delegate overlayControllerDidRequestTestDismiss:self];
 }
 
 @end

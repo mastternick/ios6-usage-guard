@@ -63,6 +63,64 @@ jobs:
         with:
           fetch-depth: 1
 
+      # The three files that carry the version are edited by different people;
+      # a release with mismatched metadata is worse than a red build.
+      - name: Verify version consistency
+        run: |
+          set -euo pipefail
+          want="1.0.2"
+          fail=0
+
+          report() {  # $1 file, $2 extracted value, $3 label
+            if [ ! -f "$1" ]; then
+              echo "::error::$1 is missing; cannot verify $3 (expected $want)"
+              fail=1
+            elif [ "$2" = "$want" ]; then
+              echo "ok   $3 = $2  ($1)"
+            else
+              echo "::error::$3 in $1 is '$2', expected '$want'"
+              fail=1
+            fi
+          }
+
+          control_version="$(sed -n 's/^Version:[[:space:]]*//p' control | head -n1)"
+
+          # Theos stages prefs/Resources/Info.plist as the bundle's Info.plist;
+          # a plain prefs/Info.plist is still accepted. No candidate at all is a
+          # hard failure, with a message that says so.
+          # Extractions must not trip `set -e` when a file is absent: the file
+          # check inside report() produces the diagnostic instead.
+          plist_file=""
+          for candidate in prefs/Resources/Info.plist prefs/Info.plist; do
+            if [ -f "$candidate" ]; then
+              plist_file="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$plist_file" ]; then
+            echo "::error::neither prefs/Resources/Info.plist nor prefs/Info.plist exists; cannot verify CFBundleShortVersionString (expected $want)"
+            fail=1
+          else
+            plist_version="$({ grep -A1 'CFBundleShortVersionString' "$plist_file" || :; } \
+              | sed -n 's/.*<string>\([^<]*\)<\/string>.*/\1/p' | head -n1)"
+            report "$plist_file" "$plist_version" "CFBundleShortVersionString"
+          fi
+
+          header_version=""
+          if [ -f src/UGVersion.h ]; then
+            header_version="$({ grep -E '^[[:space:]]*#define[[:space:]]+UG_VERSION([[:space:]]|$)' \
+              src/UGVersion.h || :; } | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -n1)"
+          fi
+
+          report control "$control_version" "control Version"
+          report src/UGVersion.h "$header_version" "UG_VERSION"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::version metadata is inconsistent; every file above must read $want"
+            exit 1
+          fi
+
       - name: Install host dependencies
         run: |
           set -euo pipefail
@@ -337,6 +395,21 @@ jobs:
             echo "::error::Usage Guard build failed (exit $status); full make output is above and in build-logs/usage-guard-build.log"
             exit "$status"
           fi
+          # The aggregate Makefile stages the tweak, the preference bundle and
+          # the PreferenceLoader entry; show what was actually staged, and fail
+          # before packaging if the Settings entry is absent.
+          echo "--- staged payload (.theos/_) ---"
+          if [ ! -d .theos/_ ]; then
+            echo "::error::no staged payload at .theos/_; nothing was installed"
+            exit 1
+          fi
+          staged="$(find .theos/_ -type f | sort)"
+          printf '%s\n' "$staged"
+          if ! printf '%s\n' "$staged" \
+               | grep -qxF '.theos/_/Library/PreferenceLoader/Preferences/UsageGuard.plist'; then
+            echo "::error::staged payload is missing Library/PreferenceLoader/Preferences/UsageGuard.plist"
+            exit 1
+          fi
           set -- packages/*.deb
           if [ ! -e "$1" ]; then
             echo "::error::Usage Guard build produced no package in packages/"
@@ -409,7 +482,8 @@ jobs:
               "## Usage Guard %s" % tag,
               "",
               "**armv7 (32-bit) · iOS 6.0+ · rootful** — for jailbroken iOS 6 devices",
-              "(iPhone 4S, iPad 2/3, iPod touch 5) with Cydia Substrate installed.",
+              "(iPhone 4S, iPad 2/3, iPod touch 5) with Cydia Substrate and PreferenceLoader",
+              "installed.",
               "",
               "- package id: `org.usageguard.timer`",
               "- architecture: armv7 only; deployment target iOS 6.0; rootful layout",
@@ -437,6 +511,13 @@ jobs:
               "| `%s` | `%s` | Usage Guard tweak |" % (main_name, digest(main_deb)),
               "| `%s` | `%s` | optional smoke-test probe |" % (probe_name, digest(probe_deb)),
               "",
+              "SHA-256 of the published files:",
+              "",
+              "```",
+              "%s  %s" % (digest(main_deb), main_name),
+              "%s  %s" % (digest(probe_deb), probe_name),
+              "```",
+              "",
               "`%s` only proves that injection works: it hooks SpringBoard's" % probe_name,
               "`applicationDidFinishLaunching:`, shows a 3 second non-interactive label and logs",
               "once. It writes nothing and stores nothing.",
@@ -451,8 +532,22 @@ jobs:
               "",
               "Both packages were checked by `scripts/validate_deb.py`: thin armv7 Mach-O",
               "(cputype 12 / subtype 9), `LC_VERSION_MIN_IPHONEOS` 6.0.0, `LC_CODE_SIGNATURE`,",
-              "`Architecture: iphoneos-arm`, `Depends: mobilesubstrate`, and exactly the dylib",
-              "plus filter plist under `Library/MobileSubstrate/DynamicLibraries/`.",
+              "`Architecture: iphoneos-arm` and `Depends: mobilesubstrate`.",
+              "",
+              "`%s` carries exactly this payload; a missing or extra file fails the build:" % main_name,
+              "",
+              "```",
+              "Library/MobileSubstrate/DynamicLibraries/UsageGuard.dylib",
+              "Library/MobileSubstrate/DynamicLibraries/UsageGuard.plist",
+              "Library/PreferenceBundles/UsageGuardPrefs.bundle/UsageGuardPrefs",
+              "Library/PreferenceBundles/UsageGuardPrefs.bundle/Info.plist",
+              "Library/PreferenceLoader/Preferences/UsageGuard.plist",
+              "```",
+              "",
+              "The dylib is an armv7 `MH_DYLIB`, the preference bundle binary an armv7",
+              "`MH_BUNDLE`; both are signed. Because of the bundle the package depends on",
+              "`preferenceloader`. `%s` stays a dependency-free two-file package" % probe_name,
+              "(dylib plus filter plist).",
               "",
               "<details><summary>Usage Guard — %s</summary>" % main_name,
               "",

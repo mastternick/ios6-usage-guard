@@ -147,6 +147,61 @@ static void test_override_pause_resume(void)
     CHECK(ug_is_locked(&breaking, now));
 }
 
+static void test_resume_clears_pause(void)
+{
+    UGState state;
+    long long now = 3100000;
+
+    ug_state_defaults(&state, now);
+    advance(&state, &now, 100, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 100);
+
+    ug_pause(&state, now, 30);
+    CHECK(state.overrideUntil == now + 30 * 60);
+    CHECK(ug_is_overridden(&state, now));
+
+    advance(&state, &now, 10 * 60, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 100); /* frozen by the pause */
+    CHECK(ug_is_overridden(&state, now));
+
+    ug_resume(&state, now);
+    CHECK(state.overrideUntil == 0);
+    CHECK(!ug_is_overridden(&state, now));
+    CHECK(ug_override_remaining(&state, now) == 0);
+    CHECK(state.phase == UGPhaseUsage);
+    CHECK(state.remaining == 20 * 60 - 100); /* resume credits no downtime */
+
+    advance(&state, &now, 5, 1, 1);
+    CHECK(state.remaining == 20 * 60 - 105); /* usage accrues normally again */
+
+    /* Clearing an already cleared pause is harmless. */
+    ug_resume(&state, now);
+    CHECK(state.overrideUntil == 0);
+    CHECK(state.remaining == 20 * 60 - 105);
+}
+
+static void test_resume_without_pause_changes_nothing(void)
+{
+    UGState state;
+    UGState before;
+    long long now = 3200000;
+
+    ug_state_defaults(&state, now);
+    advance(&state, &now, 30, 1, 1);
+    before = state;
+
+    ug_resume(&state, now);
+
+    CHECK(state.enabled == before.enabled);
+    CHECK(state.phase == before.phase);
+    CHECK(state.usageMinutes == before.usageMinutes);
+    CHECK(state.breakMinutes == before.breakMinutes);
+    CHECK(state.remaining == before.remaining);
+    CHECK(state.lastWall == before.lastWall);
+    CHECK(state.overrideUntil == 0);
+    CHECK(before.overrideUntil == 0);
+}
+
 static void test_reset_and_start_break(void)
 {
     UGState state;
@@ -666,6 +721,8 @@ int main(void)
     test_full_cycle_wrap();
     test_usage_gating();
     test_override_pause_resume();
+    test_resume_clears_pause();
+    test_resume_without_pause_changes_nothing();
     test_reset_and_start_break();
     test_clock_jumps();
     test_override_expiry_keeps_real_time();

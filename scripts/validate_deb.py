@@ -3,6 +3,24 @@
 
 Python standard library only: no dpkg-deb, no otool, no ldid, no network.
 
+Two payload layouts are accepted. Which one is required is decided by the
+control ``Package`` field, never by what the payload happens to contain:
+
+  tweak-only layout (``Package: org.usageguard.probe``, also the strict default
+  for any unknown package id)
+    * exactly two regular files under
+      ``Library/MobileSubstrate/DynamicLibraries/``: ``<name>.dylib`` and
+      ``<name>.plist`` with matching ``<name>``; nothing else
+
+  tweak + preference bundle layout (``Package: org.usageguard.timer``)
+    * exactly the five files in ``MAIN_PAYLOAD_FILES``:
+          Library/MobileSubstrate/DynamicLibraries/UsageGuard.dylib
+          Library/MobileSubstrate/DynamicLibraries/UsageGuard.plist
+          Library/PreferenceBundles/UsageGuardPrefs.bundle/UsageGuardPrefs
+          Library/PreferenceBundles/UsageGuardPrefs.bundle/Info.plist
+          Library/PreferenceLoader/Preferences/UsageGuard.plist
+    * ``Depends`` also lists ``preferenceloader``
+
 What it enforces, on a single .deb:
 
   container
@@ -13,14 +31,16 @@ What it enforces, on a single .deb:
     * ``Architecture: iphoneos-arm``
     * ``Package`` and ``Version`` present and non-empty
     * ``Depends`` lists ``mobilesubstrate`` (optionally with a version clause)
+    * ``Depends`` lists ``preferenceloader`` (tweak + preference bundle layout
+      only; the probe must stay dependency-free)
 
   payload layout
     * every path is relative, normalised, free of ``..``, ``/home/``, ``/dev/``,
       drive letters and backslashes
-    * the payload is exactly two regular files:
-          Library/MobileSubstrate/DynamicLibraries/<name>.dylib
-          Library/MobileSubstrate/DynamicLibraries/<name>.plist
-      with matching <name>; nothing else (no symlinks, no DEBIAN leftovers)
+    * only the directories leading to the expected files are present, and only
+      regular files are accepted (no symlinks, no DEBIAN leftovers)
+    * the file set is exactly the one required by the layout above; a missing
+      or extra file fails the check with the diff in the detail column
 
   filter plist
     * parses as a property list (XML or binary)
@@ -32,6 +52,16 @@ What it enforces, on a single .deb:
     * LC_VERSION_MIN_IPHONEOS present with min OS 6.0.0
     * LC_CODE_SIGNATURE present (ldid -S happened)
     * LC_ID_DYLIB install name is /Library/MobileSubstrate/DynamicLibraries/<name>.dylib
+
+  Mach-O (the preference bundle binary, tweak + preference bundle layout only)
+    * thin little-endian 32-bit Mach-O, filetype MH_BUNDLE
+    * cputype == 12 (CPU_TYPE_ARM), cpusubtype == 9 (CPU_SUBTYPE_ARM_V7)
+    * LC_VERSION_MIN_IPHONEOS present with min OS 6.0.0
+    * LC_CODE_SIGNATURE present
+
+  PreferenceLoader plist (tweak + preference bundle layout only)
+    * parses as a property list
+    * top-level ``entry`` dict names ``bundle`` == ``UsageGuardPrefs``
 
 Exit status is 0 only when every applicable check passes. Failures print the
 check name plus the observed value, so a red CI run is diagnosable from the log.
@@ -63,6 +93,9 @@ MH_MAGIC_BE = 0xFEEDFACE       # same value read big endian means byte-swapped
 CPU_TYPE_ARM = 12
 CPU_SUBTYPE_ARM_V7 = 9
 MH_DYLIB = 6
+MH_BUNDLE = 8
+
+FILETYPE_NAMES = {MH_DYLIB: "MH_DYLIB", MH_BUNDLE: "MH_BUNDLE"}
 
 LC_CODE_SIGNATURE = 0x1D
 LC_VERSION_MIN_IPHONEOS = 0x25
@@ -72,7 +105,31 @@ DYLIB_DIR = "Library/MobileSubstrate/DynamicLibraries"
 EXPECTED_BUNDLE = "com.apple.springboard"
 MIN_OS_REQUIRED = (6, 0, 0)
 
+# Package ids decide which payload layout is required (see the module docstring).
+MAIN_PACKAGE = "org.usageguard.timer"
+
+# The tweak + preference bundle layout. The self-test mirrors these paths.
+MAIN_DYLIB = "UsageGuard"
+PREFERENCE_BUNDLE = "UsageGuardPrefs"
+PREFERENCE_LOADER_DIR = "Library/PreferenceLoader"
+PREFERENCES_DIR = PREFERENCE_LOADER_DIR + "/Preferences"
+BUNDLE_PARENT_DIR = "Library/PreferenceBundles"
+BUNDLE_DIR = "%s/%s.bundle" % (BUNDLE_PARENT_DIR, PREFERENCE_BUNDLE)
+
+MAIN_PAYLOAD_FILES = (
+    "%s/%s.dylib" % (DYLIB_DIR, MAIN_DYLIB),
+    "%s/%s.plist" % (DYLIB_DIR, MAIN_DYLIB),
+    "%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE),
+    "%s/Info.plist" % BUNDLE_DIR,
+    "%s/%s.plist" % (PREFERENCES_DIR, MAIN_DYLIB),
+)
+
 FORBIDDEN_PREFIXES = ("home/", "dev/", "tmp/", "private/", "var/jb/")
+
+# Mach-O errors that describe the architecture/container rather than a command.
+ARCHITECTURE_ERROR_MARKERS = ("cputype", "cpusubtype", "filetype", "universal",
+                              "64-bit", "magic", "too small", "fat slice",
+                              "extends beyond")
 
 
 # --------------------------------------------------------------------------- #
@@ -228,7 +285,12 @@ def decode_version(value):
     return (value >> 16, (value >> 8) & 0xFF, value & 0xFF)
 
 
-def parse_macho(payload):
+def architecture_errors(errors):
+    """The subset of Mach-O errors that describe the architecture, not commands."""
+    return [e for e in errors if any(marker in e for marker in ARCHITECTURE_ERROR_MARKERS)]
+
+
+def parse_macho(payload, expected_filetype=MH_DYLIB):
     """Return (info_dict, [error strings]) for a Mach-O payload."""
     errors = []
     info = {}
@@ -254,7 +316,8 @@ def parse_macho(payload):
                           % (arch_cputype, arch_subtype)]
         if arch_offset + arch_size > len(payload):
             return info, ["fat slice extends beyond end of file"]
-        inner_info, inner_errors = parse_macho(payload[arch_offset:arch_offset + arch_size])
+        inner_info, inner_errors = parse_macho(payload[arch_offset:arch_offset + arch_size],
+                                              expected_filetype)
         inner_info["fat"] = True
         return inner_info, inner_errors
     if magic_le in (FAT_MAGIC, FAT_MAGIC_64):
@@ -273,8 +336,10 @@ def parse_macho(payload):
         errors.append("cputype is %d, expected %d (CPU_TYPE_ARM)" % (cputype, CPU_TYPE_ARM))
     if subtype != CPU_SUBTYPE_ARM_V7:
         errors.append("cpusubtype is %d, expected %d (CPU_SUBTYPE_ARM_V7)" % (subtype, CPU_SUBTYPE_ARM_V7))
-    if filetype != MH_DYLIB:
-        errors.append("filetype is %d, expected %d (MH_DYLIB)" % (filetype, MH_DYLIB))
+    if filetype != expected_filetype:
+        errors.append("filetype is %d, expected %d (%s)"
+                      % (filetype, expected_filetype,
+                         FILETYPE_NAMES.get(expected_filetype, "?")))
 
     offset = 28
     end = 28 + sizeofcmds
@@ -349,18 +414,79 @@ def parse_control(text):
     return fields
 
 
-def depends_contains_mobilesubstrate(value):
+def depends_contains(value, wanted):
     for clause in value.split(","):
         first = clause.split("|")[0].strip()
         name = first.split("(")[0].strip()
-        if name.lower() == "mobilesubstrate":
+        if name.lower() == wanted:
             return True
     return False
+
+
+def depends_contains_mobilesubstrate(value):
+    return depends_contains(value, "mobilesubstrate")
+
+
+def wants_preference_layout(fields):
+    """Return True when this package must carry the preference bundle payload.
+
+    The package id decides, so a package cannot opt into the weaker two-file
+    layout by shipping a two-file payload. The probe keeps the dependency-free
+    layout, and so does any unknown package id, which is why the probe (run with
+    ``--expect-package org.usageguard.probe``) is never asked for
+    ``preferenceloader``.
+    """
+    return fields.get("package", "") == MAIN_PACKAGE
 
 
 # --------------------------------------------------------------------------- #
 # Per-deb validation
 # --------------------------------------------------------------------------- #
+
+def validate_preference_bundle(report, payload_files):
+    """Check the preference bundle binary and its PreferenceLoader entry plist."""
+    bundle_key = "%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE)
+    bundle_payload = payload_files.get(bundle_key)
+    if bundle_payload is None:
+        for name in ("bundle binary is armv7 MH_BUNDLE",
+                     "bundle LC_VERSION_MIN_IPHONEOS 6.0.0",
+                     "bundle LC_CODE_SIGNATURE present"):
+            report.fail(name, "%s is missing from the payload" % bundle_key)
+    else:
+        info, errors = parse_macho(bundle_payload, expected_filetype=MH_BUNDLE)
+        unsigned = [e for e in errors if "LC_CODE_SIGNATURE" in e]
+        report.check("bundle binary is armv7 MH_BUNDLE", not architecture_errors(errors),
+                     "cputype=%s subtype=%s%s" % (info.get("cputype", "?"),
+                                                  info.get("cpusubtype", "?"),
+                                                  ", single-slice fat" if info.get("fat") else ""))
+        report.check("bundle LC_VERSION_MIN_IPHONEOS 6.0.0",
+                     "min_os" in info and info["min_os"] == MIN_OS_REQUIRED,
+                     "%d.%d.%d" % info["min_os"] if "min_os" in info else "missing")
+        report.check("bundle LC_CODE_SIGNATURE present", not unsigned,
+                     "unsigned" if unsigned else "signed")
+        report.check("bundle Mach-O load commands clean", not errors,
+                     "ok" if not errors else "; ".join(errors))
+
+    prefs_key = "%s/%s.plist" % (PREFERENCES_DIR, MAIN_DYLIB)
+    problems = []
+    prefs_payload = payload_files.get(prefs_key)
+    if prefs_payload is None:
+        problems.append("%s is missing from the payload" % prefs_key)
+    else:
+        try:
+            parsed = plistlib.loads(prefs_payload)
+            entry = parsed.get("entry") if isinstance(parsed, dict) else None
+            if not isinstance(entry, dict):
+                problems.append("top-level 'entry' dict missing")
+            else:
+                bundle = entry.get("bundle")
+                if bundle != PREFERENCE_BUNDLE:
+                    problems.append("entry.bundle is %r, expected %r" % (bundle, PREFERENCE_BUNDLE))
+        except Exception as error:  # plistlib raises several unrelated types
+            problems.append("not a valid property list: %s" % error)
+    report.check("PreferenceLoader plist names %s" % PREFERENCE_BUNDLE,
+                 not problems, "; ".join(problems) or PREFERENCE_BUNDLE)
+
 
 def validate(deb_path, args):
     report = Report(deb_path)
@@ -428,6 +554,11 @@ def validate(deb_path, args):
     report.check("control: Depends mobilesubstrate", depends_contains_mobilesubstrate(depends),
                  depends or "<missing>")
 
+    preference_layout = wants_preference_layout(fields)
+    if preference_layout:
+        report.check("control: Depends preferenceloader", depends_contains(depends, "preferenceloader"),
+                     depends or "<missing>")
+
     if args.expect_package:
         package = fields.get("package", "")
         report.check("control: Package matches expectation",
@@ -449,7 +580,9 @@ def validate(deb_path, args):
 
     payload_files = {}
     problems = []
-    allowed_dirs = {"", "Library", "Library/MobileSubstrate", DYLIB_DIR}
+    allowed_dirs = {"", "Library", "Library/MobileSubstrate", DYLIB_DIR,
+                    PREFERENCE_LOADER_DIR, PREFERENCES_DIR,
+                    BUNDLE_PARENT_DIR, BUNDLE_DIR}
 
     for path, member, payload in data_entries:
         if member.isdir():
@@ -477,25 +610,37 @@ def validate(deb_path, args):
 
     report.check("payload paths normalised", not problems, "; ".join(problems[:6]) or "ok")
 
-    expected_names = set()
-    for name in payload_files:
-        base = os.path.basename(name)
-        if os.path.dirname(name) == DYLIB_DIR:
-            expected_names.add(os.path.splitext(base)[0])
-    unexpected = sorted(set(payload_files) - {
-        "%s/%s.dylib" % (DYLIB_DIR, name) for name in expected_names
-    } - {
-        "%s/%s.plist" % (DYLIB_DIR, name) for name in expected_names
-    })
-    report.check("payload is only the MobileSubstrate dylib + filter plist",
-                 len(expected_names) == 1 and len(payload_files) == 2 and not unexpected,
-                 ", ".join(sorted(payload_files)) or "empty payload")
+    if preference_layout:
+        missing = sorted(set(MAIN_PAYLOAD_FILES) - set(payload_files))
+        unexpected = sorted(set(payload_files) - set(MAIN_PAYLOAD_FILES))
+        if missing or unexpected:
+            detail = "missing: %s; unexpected: %s" % (
+                ", ".join(missing) or "none", ", ".join(unexpected) or "none")
+        else:
+            detail = "%d files" % len(MAIN_PAYLOAD_FILES)
+        report.check("payload matches expected file set", not missing and not unexpected, detail)
+        base_name = MAIN_DYLIB
+    else:
+        expected_names = set()
+        for name in payload_files:
+            base = os.path.basename(name)
+            if os.path.dirname(name) == DYLIB_DIR:
+                expected_names.add(os.path.splitext(base)[0])
+        unexpected = sorted(set(payload_files) - {
+            "%s/%s.dylib" % (DYLIB_DIR, name) for name in expected_names
+        } - {
+            "%s/%s.plist" % (DYLIB_DIR, name) for name in expected_names
+        })
+        report.check("payload is only the MobileSubstrate dylib + filter plist",
+                     len(expected_names) == 1 and len(payload_files) == 2 and not unexpected,
+                     ", ".join(sorted(payload_files)) or "empty payload")
 
-    if len(expected_names) != 1:
-        report.print_table()
-        return report
+        if len(expected_names) != 1:
+            report.print_table()
+            return report
 
-    base_name = expected_names.pop()
+        base_name = expected_names.pop()
+
     if args.expect_base:
         report.check("payload base name matches expectation",
                      fnmatch.fnmatchcase(base_name, args.expect_base),
@@ -530,10 +675,7 @@ def validate(deb_path, args):
     # ---- Mach-O ---------------------------------------------------------- #
     info, macho_errors = parse_macho(payload_files[dylib_key])
     report.check("Mach-O is armv7 MH_DYLIB",
-                 not [e for e in macho_errors if "cputype" in e or "cpusubtype" in e
-                      or "filetype" in e or "universal" in e or "64-bit" in e
-                      or "magic" in e or "too small" in e or "fat slice" in e
-                      or "extends beyond" in e],
+                 not architecture_errors(macho_errors),
                  "cputype=%s subtype=%s%s" % (info.get("cputype", "?"), info.get("cpusubtype", "?"),
                                               ", single-slice fat" if info.get("fat") else ""))
     report.check("LC_VERSION_MIN_IPHONEOS 6.0.0",
@@ -549,6 +691,9 @@ def validate(deb_path, args):
 
     report.check("Mach-O load commands clean", not macho_errors,
                  "ok" if not macho_errors else "; ".join(macho_errors))
+
+    if preference_layout:
+        validate_preference_bundle(report, payload_files)
 
     report.print_table()
     return report

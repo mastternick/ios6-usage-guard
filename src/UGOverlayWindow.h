@@ -5,6 +5,8 @@
 @protocol UGOverlayControllerDelegate <NSObject>
 - (void)overlayControllerDidRequestEmergencyCall:(UGOverlayController *)controller;
 - (void)overlayControllerDidRequestParentAccess:(UGOverlayController *)controller;
+/* The test-mode dismiss button was tapped; the runtime ends the preview. */
+- (void)overlayControllerDidRequestTestDismiss:(UGOverlayController *)controller;
 @end
 
 /*
@@ -25,6 +27,11 @@
 /* Child-facing message shown in place of the minute count (for example when the
  * emergency call cannot be dialled). Cleared when the overlay hides. */
 - (void)showNotice:(NSString *)notice;
+
+/* Settings preview: shows the break screen with test copy and a dismiss button
+ * instead of the emergency valve, so a preview can neither call 112 nor open
+ * the parent gate. Toggling it off restores the real break copy. */
+- (void)setTestMode:(BOOL)testMode;
 
 @end
 
