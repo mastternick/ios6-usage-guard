@@ -43,8 +43,8 @@ SpringBoard restarts.
 
 There is **no factory, universal or recovery PIN**. On first run (no PIN
 stored) the setup wizard asks for the PIN twice before the panel becomes usable.
-If the wizard is postponed, the panel stays locked until a PIN is set; the
-seven-tap gesture opens the wizard again.
+If the wizard is postponed the guard stays inert — nothing is enforced and the
+overlay never appears — and the wizard reopens the next time the pane is shown.
 
 ## PIN storage
 
@@ -96,8 +96,11 @@ The package also installs a preference bundle
 (`/Library/PreferenceBundles/UsageGuardPrefs.bundle`) plus a PreferenceLoader
 entry (`/Library/PreferenceLoader/Preferences/UsageGuard.plist`), so a
 **Usage Guard** row appears at the bottom of `Settings`. There is no app icon:
-the pane lives in Settings. The bundle is a plain grouped table view with five
-sections, top to bottom:
+the pane lives in Settings. The entry is a real controller (`isController` plus
+`detail` in the entry plist, `NSPrincipalClass` in the bundle's `Info.plist`),
+so tapping the row pushes `UGPreferencesController` — a `PSViewController`
+subclass that builds its own grouped table view — instead of a dead link cell.
+The pane has five sections, top to bottom:
 
 | section | rows |
 | --- | --- |
@@ -109,7 +112,10 @@ sections, top to bottom:
 
 The pane keeps no copy of the state: every read reloads the preferences file and
 every change is a read-modify-write that is announced to SpringBoard (see
-below), so the pane and the break overlay cannot disagree. `Cere PIN pentru
+below). The remaining-time rows do not come from that snapshot either: they take
+the runtime's published `Remaining` and subtract the age of the status heartbeat
+(`Remaining - (now - LastTick)`, floored at zero), so the pane counts down with
+the overlay instead of showing a value up to a minute stale. `Cere PIN pentru
 modificări` defaults to on, which makes every row that changes the cycle or the
 PIN ask for the PIN first; the test-overlay row never asks, because it changes
 nothing. `Reia restricțiile` is the way out of a parent pause: it clears the
@@ -119,18 +125,21 @@ pause immediately instead of waiting for it to expire.
 
 A fresh install is **inert but loaded**: the tweak is injected into SpringBoard,
 waits for the status heartbeat, and enforces nothing until setup is complete.
-No cycle state is persisted, nothing is locked, the overlay stays down and the
-Home/Siri suppression is never armed. A device that already has a preferences
-file from an earlier release is treated as set up (the flag is pinned on first
-read), so upgrading does not re-run the wizard.
+The preferences file is created at load and holds exactly one key,
+`SetupComplete = 0`: no cycle state, no PIN, nothing locked, no overlay, and the
+Home/Siri suppression is never armed until setup finishes. A device that already
+has a cycle state from an earlier release is treated as set up (the flag is
+pinned to `YES` on first read), so upgrading does not re-run the wizard.
 
-Setup runs either from Settings → Usage Guard (the wizard opens the first time
-the pane is shown) or from the overlay's seven-tap parent panel. It asks for the
-PIN twice, then the usage and break durations, explains the emergency valve, and
+Setup runs from Settings → Usage Guard: the wizard opens the first time the pane
+is shown. The overlay's seven-tap parent panel is *not* a setup path — the
+overlay only appears once a break is running or through `Testează ecranul de
+blocare`, and neither can happen before setup. The wizard asks for the PIN
+twice, then the usage and break durations, explains the emergency valve, and
 finishes by storing the PIN, both durations, `SetupComplete = YES` and
 `enabled = 1`. The usage clock is re-anchored at that moment, so no time is
-billed for the period before setup finished. Until then nothing is written to
-the preferences file.
+billed for the period before setup finished. Until then `SetupComplete = 0` is
+the only key the tweak has written.
 
 ## Settings ↔ runtime communication
 
@@ -267,7 +276,10 @@ gh run download --name usage-guard-deb
 
 Validation is enforced, not advisory: before building, the pipeline fails unless
 `control`, the bundle's `Info.plist` (`prefs/Resources/Info.plist`, the file
-Theos stages into the bundle) and `src/UGVersion.h` all carry the same version.
+Theos stages into the bundle) and `src/UGVersion.h` all carry the same version,
+and unless the pane takes that version from the header — a hard-coded `1.0.2`
+literal in `prefs/UGPreferencesController.m` or `prefs/UGSettingsIPC.m` fails
+the build.
 The validator then fails the package unless
 
 * the payload is exactly five files — the armv7 `MH_DYLIB` and its filter plist
@@ -278,13 +290,21 @@ The validator then fails the package unless
   entry `Library/PreferenceLoader/Preferences/UsageGuard.plist`;
 * the filter plist names `com.apple.springboard` and the PreferenceLoader plist
   names the `UsageGuardPrefs` bundle;
+* the PreferenceLoader entry is a real controller — `entry.isController` is
+  boolean true, `entry.detail` names the controller class and `entry.bundle` is
+  `UsageGuardPrefs` — so PreferenceLoader loads the bundle and pushes the pane;
+* the bundle's `Info.plist` declares `CFBundleExecutable` (`UsageGuardPrefs`,
+  the binary that must exist) and a non-empty `NSPrincipalClass` (the class
+  PreferenceLoader instantiates; the two keys are independent and may differ);
 * both binaries are single-slice **armv7**, `LC_VERSION_MIN_IPHONEOS` 6.0.0 and
   signed (`LC_CODE_SIGNATURE`);
 * `Architecture: iphoneos-arm` and `Depends:` list `mobilesubstrate` and
   `preferenceloader`.
 
 The probe package keeps its own, dependency-free two-file payload (dylib plus
-filter plist); the validator checks each layout separately.
+filter plist); the validator checks each layout separately, and it rejects
+`Library/PreferenceLoader` or `Library/PreferenceBundles` content — even an
+empty directory — in any package other than `org.usageguard.timer`.
 
 ### Local build (optional, requires your own toolchain)
 
@@ -384,9 +404,12 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   three seconds while the break overlay is visible.
 * **No Usage Guard row in Settings.** PreferenceLoader is a declared dependency
   (`Depends: ... preferenceloader ...`); reinstall the package so dpkg pulls it
-  in, then respring. If the row is there but the Status section reports no live
-  runtime, SpringBoard has not injected the tweak or was restarted since — see
-  Diagnostics above.
+  in, then respring. If the row exists but tapping it does nothing, the bundle is
+  not loadable as a controller: the entry plist needs `isController` true and a
+  `detail` class, and the bundle's `Info.plist` needs `NSPrincipalClass` — CI
+  fails the build when any of them is missing. If the row is there but the
+  Status section reports no live runtime, SpringBoard has not injected the tweak
+  or was restarted since — see Diagnostics above.
 
 ## Limitations (honest list)
 
@@ -434,11 +457,12 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   "no tweak installed". Nothing enforces anything from that file; deleting it
   only empties the pane's Information section until the next write.
 * **The pane cannot verify a PIN change made while it is open.** The pane
-  reloads the state every second, but the authorization it granted itself stays
-  in memory until the view goes away. If the PIN is changed from the break
-  overlay's parent panel while Settings is already open, edits from that open
-  pane are not re-prompted. Closing and reopening Settings restores the PIN
-  prompt.
+  reloads the state every second, so a PIN changed from the break overlay's
+  parent panel is visible to it, but the authorization it already granted is not
+  re-checked. What it does do is drop that authorization whenever the pane
+  disappears or Preferences.app leaves the foreground (resign-active or
+  background): reopening Settings always asks for the PIN again, and reaching
+  Home and coming back to a suspended Preferences.app does too.
 * **SpringBoard only.** Nothing is injected into individual apps; the overlay
   is a SpringBoard-level window at `UIWindowLevelAlert + 1000` that is
   re-raised on every 1 Hz synchronisation while a break is running.

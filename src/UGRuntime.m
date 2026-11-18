@@ -294,6 +294,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
 @interface UGRuntime () <UGOverlayControllerDelegate, UGParentPanelDelegate>
 - (void)handleSettingsChanged;
+- (BOOL)adoptDiskStateIfChanged;
 - (void)beginTestOverlay;
 - (void)updateTestOverlayAt:(long long)now;
 - (void)endTestOverlay;
@@ -353,7 +354,13 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 
     _prefs = [UGPrefs sharedPrefs];
     [_prefs loadState:&_state now:UGNowSeconds()];
-    _setupComplete = [_prefs setupComplete];
+    _savedStateString = [_prefs diskStateString];
+
+    /* While the kill switch is engaged the plist must not be touched at all,
+     * and -setupComplete may migrate (write) the key. The migration is
+     * therefore deferred to -activate, which only runs once the runtime is
+     * live. */
+    if (!UGKillSwitchEngaged()) _setupComplete = [_prefs setupComplete];
 
     _runtimePID = (long long)getpid();
     if (_runtimeStartedAt <= 0) _runtimeStartedAt = UGNowSeconds();
@@ -410,6 +417,13 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         if (!_inert) return NO;
         _inert = NO;
         UGLog(@"Usage Guard: disable marker removed, resuming");
+        /* Settings may have written while the tweak was inert (enable, limits,
+         * pause, a new PIN). Re-read the file before re-anchoring: starting
+         * from the stale cache would persist the old state over those writes
+         * and verifyPIN: could restore a replaced PIN vault. */
+        [_prefs reloadFromDisk];
+        [_prefs loadState:&_state now:UGNowSeconds()];
+        _setupComplete = [_prefs setupComplete];
         /* The inert interval is not credited to usage; a break keeps elapsing. */
         ug_state_startup(&_state, UGNowSeconds());
         [self activate];
@@ -422,6 +436,9 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         sUGOverlayLocked = 0;
         _emergencyUntil = 0;
         _emergencyCallSeen = NO;
+        /* A preview left running would keep the overlay window visible while
+         * the tweak is supposed to be doing nothing at all. */
+        [self endTestOverlay];
 
         if (_panelPresented) {
             _panelPresented = NO;
@@ -445,7 +462,12 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     BOOL wasScreenOn;
     BOOL wasUnlocked;
 
-    if ([self enterInertModeIfNeeded]) return;
+    if ([self enterInertModeIfNeeded]) {
+        /* Inert: no accounting and no UI, but the heartbeat keeps running so
+         * the Preferences pane can tell "loaded but inert" from "not loaded". */
+        [self writeStatusIfNeeded:NO];
+        return;
+    }
 
     wasScreenOn = _screenOn;
     wasUnlocked = _unlocked;
@@ -512,6 +534,17 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     if (!forced && now >= _lastPersistWall &&
         now - _lastPersistWall < kUGPersistIntervalSeconds) return;
 
+    /* Another process wrote the cycle state since our last save (the pane can
+     * land between a Settings write and the notification, or while this
+     * process also saves). Writing now would replace that change, so adopt it
+     * first and let the normal decision run on the merged state. */
+    if ([self adoptDiskStateIfChanged]) {
+        if (ug_serialize(&_state, buffer, sizeof buffer) == 0) return;
+        encoded = [NSString stringWithUTF8String:buffer];
+        if (_savedStateString && [encoded isEqualToString:_savedStateString]) return;
+        now = UGNowSeconds();
+    }
+
     if ([_prefs saveState:&_state]) {
         _savedStateString = encoded;
         _lastPersistWall = now;
@@ -575,7 +608,11 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     now = UGNowSeconds();
 
     if (_testModeActive) {
-        if (_panelPresented) {
+        if (!_screenOn || !_unlocked || _callActive) {
+            /* A preview must never sit over the lock screen, a dark screen or
+             * a call screen: end it as soon as the device stops being usable. */
+            [self endTestOverlay];
+        } else if (_panelPresented) {
             /* The panel needs the window; the preview must not fight it. */
             [self endTestOverlay];
         } else if (!(ug_is_locked(&_state, now) && _screenOn && _unlocked &&
@@ -648,6 +685,9 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     long long now;
 
     if (_inert || _panelPresented) return;
+    /* Same rule as tick: never start a preview over a lock screen, a dark
+     * screen or a call. */
+    if (!_screenOn || !_unlocked || _callActive) return;
     /* A real break is already on screen: the preview has nothing to add and
      * must not replace the live countdown. */
     if (ug_is_locked(&_state, UGNowSeconds()) && _screenOn && _unlocked) return;
@@ -693,10 +733,10 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 /*
  * Heartbeat read by the Preferences pane. Written when something meaningful
  * changed, when it is older than kUGStatusRefreshSeconds, or when forced. The
- * signature deliberately leaves LastTick out: it moves every second, and
- * rewriting the plist at 1 Hz would be pure churn for a heartbeat the 5 s
- * refresh already keeps fresh. A failed write is logged once and otherwise
- * ignored; the guard never depends on it.
+ * signature deliberately leaves Remaining, OverrideRemaining and LastTick out:
+ * they move every second, and rewriting the plist at 1 Hz would be pure churn
+ * for a heartbeat the 5 s refresh already keeps fresh. A failed write is
+ * logged once and otherwise ignored; the guard never depends on it.
  */
 - (void)writeStatusIfNeeded:(BOOL)forced
 {
@@ -716,17 +756,19 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     killSwitch = UGKillSwitchEngaged();
     debugLogging = UGDebugLoggingEnabled();
 
+    /* Deliberately no Remaining and no OverrideRemaining here: both move with
+     * the clock and would otherwise rewrite the file at 1 Hz. With them
+     * excluded, a write happens when a real field changes or when the 5 s
+     * heartbeat is due, and LastTick below is refreshed on that write. */
     signature = [NSString stringWithFormat:
-        @"%lld|%lld|%d|%d|%d|%lld|%d|%d|%lld|%d|%d|%d|%@",
+        @"%lld|%lld|%d|%d|%d|%d|%d|%d|%d|%d|%@",
         _runtimePID,
         _runtimeStartedAt,
         enabled ? 1 : 0,
         _setupComplete ? 1 : 0,
         _state.phase,
-        _state.remaining,
         _state.usageMinutes,
         _state.breakMinutes,
-        overrideRemaining,
         _inert ? 1 : 0,
         killSwitch ? 1 : 0,
         debugLogging ? 1 : 0,
@@ -773,16 +815,45 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 #pragma mark - Settings reload
 
 /*
- * The Preferences pane just wrote the plist. Adopt whatever it stored (State,
- * SetupComplete, RequirePIN, durations) and repaint; a state that matches what
- * is already persisted is not rewritten.
+ * Takes over the cycle state another process wrote (the pane's enable/disable,
+ * limits, pause or reset), and only when the string on disk differs from the
+ * one this runtime last wrote. Returns YES when the disk state was adopted;
+ * otherwise the in-memory state stays authoritative.
+ */
+- (BOOL)adoptDiskStateIfChanged
+{
+    NSString *onDisk;
+    long long now;
+
+    if (!_prefs) return NO;
+    onDisk = [_prefs diskStateString];
+    /* nil means the file or the key is absent/unreadable: nothing to adopt. */
+    if (!onDisk) return NO;
+    if (_savedStateString && [onDisk isEqualToString:_savedStateString]) return NO;
+
+    [_prefs reloadFromDisk];
+    now = UGNowSeconds();
+    [_prefs loadState:&_state now:now];
+    _savedStateString = onDisk;
+    UGLog(@"Usage Guard: adopted the cycle state written by Settings");
+    return YES;
+}
+
+/*
+ * The Preferences pane just wrote the plist. SetupComplete, RequirePIN and the
+ * PIN vault are refreshed on every notification; the cycle state is adopted
+ * only when the file really holds a different State than the one this runtime
+ * last wrote. A notification that never touched State (PIN check, a failed
+ * attempt, setRequirePIN:, setSetupComplete:) must not throw away the usage
+ * accounted since the last persist — that would hand the child back up to a
+ * minute of allowance on demand.
  */
 - (void)handleSettingsChanged
 {
     BOOL wasSetupComplete = _setupComplete;
 
     [_prefs reloadFromDisk];
-    [_prefs loadState:&_state now:UGNowSeconds()];
+    [self adoptDiskStateIfChanged];
     _setupComplete = [_prefs setupComplete];
 
     /* Enforcement only starts once setup is complete, so re-anchor the clock

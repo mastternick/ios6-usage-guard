@@ -18,5 +18,7 @@
 	<string>1.0.2</string>
 	<key>MinimumOSVersion</key>
 	<string>6.0</string>
+	<key>NSPrincipalClass</key>
+	<string>UGPreferencesController</string>
 </dict>
 </plist>

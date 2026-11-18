@@ -63,8 +63,10 @@ jobs:
         with:
           fetch-depth: 1
 
-      # The three files that carry the version are edited by different people;
-      # a release with mismatched metadata is worse than a red build.
+      # The version lives in control, src/UGVersion.h and the bundle's
+      # Info.plist, which different people edit; the pane must read UG_VERSION
+      # instead of carrying its own copy. A release with mismatched metadata is
+      # worse than a red build.
       - name: Verify version consistency
         run: |
           set -euo pipefail
@@ -115,6 +117,32 @@ jobs:
 
           report control "$control_version" "control Version"
           report src/UGVersion.h "$header_version" "UG_VERSION"
+
+          # The Settings pane must take the version from src/UGVersion.h. A
+          # literal in the pane is the one place CI cannot see: it compiles and
+          # the next version bump silently ships a pane that reports the old one.
+          pane_sources="prefs/UGPreferencesController.m prefs/UGSettingsIPC.m"
+          pane_uses_version=0
+          for pane_source in $pane_sources; do
+            if [ ! -f "$pane_source" ]; then
+              echo "::error::$pane_source is missing; cannot verify it uses UG_VERSION"
+              fail=1
+              continue
+            fi
+            if grep -nF "\"$want\"" "$pane_source" >&2; then
+              echo "::error::$pane_source hard-codes the version string \"$want\"; use @UG_VERSION from src/UGVersion.h"
+              fail=1
+            else
+              echo "ok   $pane_source has no hard-coded \"$want\""
+            fi
+            if grep -qF "UG_VERSION" "$pane_source"; then
+              pane_uses_version=1
+            fi
+          done
+          if [ "$pane_uses_version" -ne 1 ]; then
+            echo "::error::neither prefs/UGPreferencesController.m nor prefs/UGSettingsIPC.m references UG_VERSION; the pane must include src/UGVersion.h"
+            fail=1
+          fi
 
           if [ "$fail" -ne 0 ]; then
             echo "::error::version metadata is inconsistent; every file above must read $want"
@@ -535,7 +563,9 @@ jobs:
               "",
               "Both packages were checked by `scripts/validate_deb.py`: thin armv7 Mach-O",
               "(cputype 12 / subtype 9), `LC_VERSION_MIN_IPHONEOS` 6.0.0, `LC_CODE_SIGNATURE`,",
-              "`Architecture: iphoneos-arm` and `Depends: mobilesubstrate`.",
+              "`Architecture: iphoneos-arm` and `Depends: mobilesubstrate`. The Settings entry",
+              "must be a controller (`isController` true with a `detail` class) and the bundle",
+              "`Info.plist` must declare `CFBundleExecutable` and `NSPrincipalClass`.",
               "",
               "`%s` carries exactly this payload; a missing or extra file fails the build:" % main_name,
               "",

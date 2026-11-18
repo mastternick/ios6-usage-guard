@@ -26,6 +26,12 @@
 /* Atomically persists the whole cycle state. Returns NO when the write fails. */
 - (BOOL)saveState:(const UGState *)state;
 
+/* The raw `State` value read freshly from the file, bypassing the cache. nil
+ * when the file, the key or a string value is missing. The runtime compares it
+ * with the string it last wrote to tell its own save from a write made by the
+ * Preferences pane. */
+- (NSString *)diskStateString;
+
 /* Re-reads the plist from disk, adopting keys another process wrote (the
  * Preferences pane, a second wizard instance). PIN vault fields, the lockout
  * window and the debug flag are refreshed with it. */
@@ -33,13 +39,17 @@
 
 /*
  * Setup gate. YES once a PIN has been configured. An install that predates the
- * key (plist present, key absent) is migrated to YES; a fresh install is pinned
- * to NO so a later launch cannot mistake it for a configured one.
+ * key (plist present, key absent) is migrated to YES only when a PIN is stored
+ * as well, so a 1.0.1 device that never set one is treated as unconfigured
+ * rather than enforcing breaks without a PIN. A fresh install is pinned to NO
+ * so a later launch cannot mistake it for a configured one.
  */
 - (BOOL)setupComplete;
 - (BOOL)setSetupComplete:(BOOL)value;
 
-/* Whether the parent panel demands a PIN. Defaults to YES. */
+/* Whether the Settings pane asks for the PIN before changing anything (switches,
+ * limits, actions). The break overlay's parent panel is gated by the PIN itself
+ * whenever one is stored, independently of this flag. Defaults to YES. */
 - (BOOL)requirePIN;
 - (BOOL)setRequirePIN:(BOOL)value;
 

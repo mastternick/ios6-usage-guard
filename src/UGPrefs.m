@@ -175,7 +175,7 @@ BOOL UGDebugLoggingEnabled(void)
                            failures:(NSInteger)failures
                        lockoutUntil:(long long)lockoutUntil;
 - (BOOL)commitPINFields:(NSDictionary *)fields;
-- (BOOL)persistPINFields;
+- (BOOL)persistPINAttemptFields;
 @end
 
 @implementation UGPrefs {
@@ -343,17 +343,33 @@ BOOL UGDebugLoggingEnabled(void)
         @{kUGStateKey: [NSString stringWithUTF8String:buffer]}];
 }
 
+/* The raw State string currently in the file, read fresh instead of from the
+ * cache. Callers compare it with the string they last wrote to tell their own
+ * write from someone else's. nil when the file or the key is missing, or when
+ * the value is not a string. */
+- (NSString *)diskStateString
+{
+    NSDictionary *stored = [NSDictionary dictionaryWithContentsOfFile:kUGPrefsPath];
+    id encoded = stored[kUGStateKey];
+
+    if (![encoded isKindOfClass:[NSString class]]) return nil;
+    return encoded;
+}
+
 - (BOOL)setupComplete
 {
     long long number;
 
     /* A migrated install must not look unfinished, and a fresh install must not
      * look finished on the next launch: both answers are pinned into the file
-     * the first time it is asked. */
+     * the first time it is asked. 1.0.1 always created the file, so its mere
+     * existence is not proof of setup: an upgraded device that never stored a
+     * PIN stays unconfigured instead of enforcing breaks with no PIN. */
     if (UGReadNumber(_values, kUGSetupCompleteKey, &number)) return number != 0;
     if (_fileExisted) {
-        [self setSetupComplete:YES];
-        return YES;
+        BOOL migrated = [self hasPIN];
+        [self setSetupComplete:migrated];
+        return migrated;
     }
     [self setSetupComplete:NO];
     return NO;
@@ -425,14 +441,16 @@ BOOL UGDebugLoggingEnabled(void)
     return [self writeValuesApplying:fields];
 }
 
-- (BOOL)persistPINFields
+/* Persists the failure counter and the lockout deadline only. Verification
+ * must never rewrite PINSalt/PINHash/PINIterations: the vault may have been
+ * replaced by another process (Settings), and writing the cached copy back
+ * would silently revert the new PIN. */
+- (BOOL)persistPINAttemptFields
 {
-    return [self commitPINFields:
-        [self PINFieldsWithSalt:_salt
-                           hash:_hash
-                     iterations:_iterations
-                       failures:_failures
-                   lockoutUntil:_lockoutUntil]];
+    return [self commitPINFields:@{
+        kUGPINFailuresKey: @(_failures),
+        kUGPINLockoutKey: @(_lockoutUntil)
+    }];
 }
 
 - (BOOL)setPIN:(NSString *)pin
@@ -488,7 +506,7 @@ BOOL UGDebugLoggingEnabled(void)
     if (candidate && UGConstantTimeEqual(candidate, _hash)) {
         _failures = 0;
         _lockoutUntil = 0;
-        [self persistPINFields];
+        [self persistPINAttemptFields];
         return YES;
     }
 
@@ -500,7 +518,7 @@ BOOL UGDebugLoggingEnabled(void)
         _lockoutUntil = now + seconds;
         UGLog(@"Usage Guard: PIN lockout for %ld s", (long)seconds);
     }
-    [self persistPINFields];
+    [self persistPINAttemptFields];
     return NO;
 }
 

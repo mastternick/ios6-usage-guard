@@ -276,11 +276,15 @@ static const NSInteger kUGParentTapCount = 7;
     }
 }
 
-/* Seven taps on the title within three seconds open the parent gate. */
+/* Seven taps on the title within three seconds open the parent gate. A
+ * preview must not: it is nothing but a visual check, and on a fresh install
+ * it would open the SpringBoard setup wizard for any child who taps the title. */
 - (void)handleTitleTap:(UITapGestureRecognizer *)recognizer
 {
     NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
     (void)recognizer;
+
+    if (_testMode) return;
 
     if (_titleTapCount == 0 || now - _firstTitleTapTime > kUGParentTapWindow) {
         _titleTapCount = 1;

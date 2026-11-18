@@ -61,9 +61,16 @@ What it enforces, on a single .deb:
     * LC_VERSION_MIN_IPHONEOS present with min OS 6.0.0
     * LC_CODE_SIGNATURE present
 
-  PreferenceLoader plist (tweak + preference bundle layout only)
+  PreferenceLoader entry (tweak + preference bundle layout only)
     * parses as a property list
     * top-level ``entry`` dict names ``bundle`` == ``UsageGuardPrefs``
+    * ``entry.isController`` is boolean true and ``entry.detail`` is a
+      non-empty class name, so PreferenceLoader pushes our PSViewController
+    * the bundle's ``Info.plist`` sets ``CFBundleExecutable`` ==
+      ``UsageGuardPrefs`` and a non-empty ``NSPrincipalClass`` (independent
+      keys: they are allowed to differ)
+    * ``Library/PreferenceLoader`` and ``Library/PreferenceBundles`` may not
+      appear at all -- not even as empty directories -- in the probe layout
 
 Exit status is 0 only when every applicable check passes. Failures print the
 check name plus the observed value, so a red CI run is diagnosable from the log.
@@ -126,6 +133,9 @@ PREFERENCE_LOADER_DIR = "Library/PreferenceLoader"
 PREFERENCES_DIR = PREFERENCE_LOADER_DIR + "/Preferences"
 BUNDLE_PARENT_DIR = "Library/PreferenceBundles"
 BUNDLE_DIR = "%s/%s.bundle" % (BUNDLE_PARENT_DIR, PREFERENCE_BUNDLE)
+# PreferenceLoader/Bundles packaging belongs to the Settings package only; the
+# probe must not ship (or even create) these directories.
+PREFERENCE_PREFIXES = (PREFERENCE_LOADER_DIR, BUNDLE_PARENT_DIR)
 
 MAIN_PAYLOAD_FILES = (
     "%s/%s.dylib" % (DYLIB_DIR, MAIN_DYLIB),
@@ -492,14 +502,22 @@ def validate_preference_bundle(report, payload_files):
         report.check("bundle Mach-O load commands clean", not errors,
                      "ok" if not errors else "; ".join(errors))
 
+    # PreferenceLoader only loads the entry's bundle as a controller when
+    # entry.isController is true, and then pushes entry.detail as a
+    # PSViewController; a plain link cell or a missing detail class means the
+    # Settings row either does nothing or crashes on the push.
     prefs_key = "%s/%s.plist" % (PREFERENCES_DIR, MAIN_DYLIB)
     problems = []
+    detail = None
     prefs_payload = payload_files.get(prefs_key)
     if prefs_payload is None:
         problems.append("%s is missing from the payload" % prefs_key)
     else:
         try:
             parsed = plistlib.loads(prefs_payload)
+        except Exception as error:  # plistlib raises several unrelated types
+            problems.append("not a valid property list: %s" % error)
+        else:
             entry = parsed.get("entry") if isinstance(parsed, dict) else None
             if not isinstance(entry, dict):
                 problems.append("top-level 'entry' dict missing")
@@ -507,10 +525,46 @@ def validate_preference_bundle(report, payload_files):
                 bundle = entry.get("bundle")
                 if bundle != PREFERENCE_BUNDLE:
                     problems.append("entry.bundle is %r, expected %r" % (bundle, PREFERENCE_BUNDLE))
+                is_controller = entry.get("isController")
+                if is_controller is not True:
+                    problems.append("entry.isController is %r, expected boolean true"
+                                    % (is_controller,))
+                detail = entry.get("detail")
+                if not isinstance(detail, str) or not detail.strip():
+                    problems.append("entry.detail is %r, expected a controller class name"
+                                    % (detail,))
+    report.check("PreferenceLoader entry is a controller", not problems,
+                 "; ".join(problems) or "%s, detail %s" % (PREFERENCE_BUNDLE, detail))
+
+    # NSPrincipalClass is the class PreferenceLoader instantiates out of the
+    # bundle; CFBundleExecutable names the binary that must carry it. They are
+    # independent keys, so a mismatch between them is not required.
+    info_key = "%s/Info.plist" % BUNDLE_DIR
+    info_problems = []
+    info_detail = ""
+    info_payload = payload_files.get(info_key)
+    if info_payload is None:
+        info_problems.append("%s is missing from the payload" % info_key)
+    else:
+        try:
+            parsed = plistlib.loads(info_payload)
         except Exception as error:  # plistlib raises several unrelated types
-            problems.append("not a valid property list: %s" % error)
-    report.check("PreferenceLoader plist names %s" % PREFERENCE_BUNDLE,
-                 not problems, "; ".join(problems) or PREFERENCE_BUNDLE)
+            info_problems.append("not a valid property list: %s" % error)
+        else:
+            if not isinstance(parsed, dict):
+                info_problems.append("top-level dict missing")
+                parsed = {}
+            executable = parsed.get("CFBundleExecutable")
+            principal = parsed.get("NSPrincipalClass")
+            if executable != PREFERENCE_BUNDLE:
+                info_problems.append("CFBundleExecutable is %r, expected %r"
+                                     % (executable, PREFERENCE_BUNDLE))
+            if not isinstance(principal, str) or not principal.strip():
+                info_problems.append("NSPrincipalClass is %r, expected a class name" % (principal,))
+            else:
+                info_detail = "%s, principal %s" % (executable, principal)
+    report.check("bundle Info.plist declares CFBundleExecutable and NSPrincipalClass",
+                 not info_problems, "; ".join(info_problems) or info_detail)
 
 
 def validate(deb_path, args):
@@ -605,9 +659,10 @@ def validate(deb_path, args):
 
     payload_files = {}
     problems = []
-    allowed_dirs = {"", "Library", "Library/MobileSubstrate", DYLIB_DIR,
-                    PREFERENCE_LOADER_DIR, PREFERENCES_DIR,
-                    BUNDLE_PARENT_DIR, BUNDLE_DIR}
+    allowed_dirs = {"", "Library", "Library/MobileSubstrate", DYLIB_DIR}
+    if preference_layout:
+        allowed_dirs |= {PREFERENCE_LOADER_DIR, PREFERENCES_DIR,
+                         BUNDLE_PARENT_DIR, BUNDLE_DIR}
 
     for path, member, payload in data_entries:
         if member.isdir():
@@ -618,12 +673,25 @@ def validate(deb_path, args):
             normalised, error = normalise_path(path)
             if error is not None:
                 problems.append("%s: %s" % (path, error))
-            elif normalised not in allowed_dirs:
+                continue
+            if not preference_layout and any(
+                    normalised == prefix or normalised.startswith(prefix + "/")
+                    for prefix in PREFERENCE_PREFIXES):
+                problems.append("%s: PreferenceLoader/PreferenceBundles directories are only "
+                                "allowed in package %s" % (normalised, MAIN_PACKAGE))
+                continue
+            if normalised not in allowed_dirs:
                 problems.append("%s: unexpected directory in payload" % normalised)
             continue
         normalised, error = normalise_path(path)
         if error is not None:
             problems.append("%s: %s" % (path, error))
+            continue
+        if not preference_layout and any(
+                normalised == prefix or normalised.startswith(prefix + "/")
+                for prefix in PREFERENCE_PREFIXES):
+            problems.append("%s: PreferenceLoader/PreferenceBundles payload is only allowed "
+                            "in package %s" % (normalised, MAIN_PACKAGE))
             continue
         if not member.isfile():
             problems.append("%s: not a regular file (symlink/hardlink/device rejected)" % normalised)

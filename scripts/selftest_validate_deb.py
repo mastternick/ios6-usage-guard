@@ -74,6 +74,10 @@ INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 \t<string>BNDL</string>
 \t<key>CFBundleShortVersionString</key>
 \t<string>1.0.2</string>
+\t<key>MinimumOSVersion</key>
+\t<string>6.0</string>
+\t<key>NSPrincipalClass</key>
+\t<string>UGPreferencesController</string>
 </dict>
 </plist>
 """
@@ -88,6 +92,12 @@ PREFERENCES_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 \t\t<string>UsageGuardPrefs</string>
 \t\t<key>cell</key>
 \t\t<string>PSLinkCell</string>
+\t\t<key>detail</key>
+\t\t<string>UGPreferencesController</string>
+\t\t<key>isController</key>
+\t\t<true/>
+\t\t<key>label</key>
+\t\t<string>Usage Guard</string>
 \t</dict>
 </dict>
 </plist>
@@ -170,6 +180,14 @@ def tar_bytes(entries, with_dirs=False):
                 archive.addfile(info)
         for name, payload in entries:
             info = tarfile.TarInfo(name)
+            if payload is None:
+                # A None payload is an explicit directory entry (e.g. an empty
+                # Library/PreferenceLoader tree in the probe package).
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                info.mtime = 0
+                archive.addfile(info)
+                continue
             info.size = len(payload)
             info.mode = 0o644
             info.mtime = 0
@@ -261,6 +279,8 @@ MAIN_ENTRIES = [
 ]
 
 BUNDLE_BINARY_KEY = "%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE)
+INFO_PLIST_KEY = "%s/Info.plist" % BUNDLE_DIR
+PREFS_PLIST_KEY = "%s/%s.plist" % (PREFERENCES_DIR, MAIN_DYLIB)
 
 
 def with_entry(entries, path, payload):
@@ -315,11 +335,36 @@ def cases(tmpdir):
                                       macho(filetype=2, id_dylib=False)),
                            control=MAIN_CONTROL)
     main_bad_prefs_plist = deb("bad-main-prefs-plist",
-                               with_entry(MAIN_ENTRIES, "%s/%s.plist" % (PREFERENCES_DIR, MAIN_DYLIB),
+                               with_entry(MAIN_ENTRIES, PREFS_PLIST_KEY,
                                           PREFERENCES_PLIST.replace(PREFERENCE_BUNDLE, "OtherPrefs").encode()),
                                control=MAIN_CONTROL)
+    main_no_iscontroller = deb("bad-main-no-iscontroller",
+                               with_entry(MAIN_ENTRIES, PREFS_PLIST_KEY,
+                                          PREFERENCES_PLIST.replace(
+                                              "\t\t<key>isController</key>\n\t\t<true/>\n", "").encode()),
+                               control=MAIN_CONTROL)
+    main_no_principal = deb("bad-main-no-principal-class",
+                            with_entry(MAIN_ENTRIES, INFO_PLIST_KEY,
+                                       INFO_PLIST.replace(
+                                           "\t<key>NSPrincipalClass</key>\n"
+                                           "\t<string>UGPreferencesController</string>\n", "").encode()),
+                            control=MAIN_CONTROL)
+    main_bad_executable = deb("bad-main-executable-mismatch",
+                              with_entry(MAIN_ENTRIES, INFO_PLIST_KEY,
+                                         INFO_PLIST.replace("<string>%s</string>" % PREFERENCE_BUNDLE,
+                                                            "<string>UsageGuard</string>", 1).encode()),
+                              control=MAIN_CONTROL)
+    main_bundle_minos = deb("bad-main-bundle-min-ios",
+                            with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                       macho(filetype=8, id_dylib=False, min_os=(7, 0, 0))),
+                            control=MAIN_CONTROL)
     main_no_preferenceloader = deb("bad-main-no-preferenceloader", MAIN_ENTRIES,
                                    control=MAIN_CONTROL.replace("preferenceloader, ", ""))
+    # PreferenceLoader/PreferenceBundles packaging belongs to org.usageguard.timer;
+    # an empty directory tree must not slip into the dependency-free probe.
+    probe_pref_dirs = deb("bad-probe-preference-dirs",
+                          GOOD_ENTRIES + [("Library/PreferenceLoader/Preferences/", None)],
+                          control=PROBE_CONTROL)
 
     wrong_arch = deb("bad-arch-arm64", [(GOOD_ENTRIES[0][0], macho(cputype=22, cpusubtype=2)),
                                         GOOD_ENTRIES[1]])
@@ -391,7 +436,17 @@ def cases(tmpdir):
         ("unsigned bundle binary rejected", main_bundle_unsigned, 1,
          "bundle LC_CODE_SIGNATURE", []),
         ("PreferenceLoader plist naming the wrong bundle rejected", main_bad_prefs_plist, 1,
-         "PreferenceLoader plist names UsageGuardPrefs", []),
+         "PreferenceLoader entry is a controller", []),
+        ("PreferenceLoader entry without isController rejected", main_no_iscontroller, 1,
+         "entry.isController is None, expected boolean true", []),
+        ("bundle Info.plist without NSPrincipalClass rejected", main_no_principal, 1,
+         "NSPrincipalClass is None", []),
+        ("bundle CFBundleExecutable mismatch rejected", main_bad_executable, 1,
+         "CFBundleExecutable is 'UsageGuard'", []),
+        ("bundle deployment target 7.0 rejected", main_bundle_minos, 1,
+         "bundle LC_VERSION_MIN_IPHONEOS 6.0.0", []),
+        ("probe package with PreferenceLoader directories rejected", probe_pref_dirs, 1,
+         "only allowed in package org.usageguard.timer", []),
         ("main package missing preferenceloader rejected", main_no_preferenceloader, 1,
          "control: Depends preferenceloader", []),
         ("arm64 slice rejected", wrong_arch, 1, "CPU_TYPE_ARM", []),

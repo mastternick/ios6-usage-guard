@@ -3,6 +3,7 @@
 #import "UGGuardCore.h"
 #import "UGPrefs.h"
 #import "UGSettingsIPC.h"
+#import "UGVersion.h"
 
 /* Section order, matching the pane from top to bottom. */
 enum {
@@ -90,7 +91,6 @@ enum {
     kUGWizardStepIdle = 7
 };
 
-static NSString *const kUGVersionString = @"1.0.2";
 static NSString *const kUGEmergencyInstructions =
     @"Păstrează această procedură pentru situații de urgență.\n\n"
      "Prin SSH, ca root:\n"
@@ -134,6 +134,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 @implementation UGPreferencesController {
     UGSettingsIPC *_ipc;
 
+    UITableView *_tableView;
     UGState _state;
     NSDictionary *_status;
     NSString *_signature;
@@ -155,12 +156,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 #pragma mark - Lifecycle
 
-- (id)initWithStyle:(UITableViewStyle)style
+- (id)initForContentSize:(CGSize)size
 {
-    (void)style;
-    /* Always grouped: PreferenceLoader may instantiate us with -init, which
-     * would otherwise give a plain table and lose the settings look. */
-    self = [super initWithStyle:UITableViewStyleGrouped];
+    self = [super initForContentSize:size];
     if (!self) return nil;
 
     _ipc = [[UGSettingsIPC alloc] init];
@@ -171,15 +169,38 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     return self;
 }
 
-- (id)init
-{
-    return [self initWithStyle:UITableViewStyleGrouped];
-}
-
 - (void)dealloc
 {
     [_refreshTimer invalidate];
     _refreshTimer = nil;
+
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+
+    /* Preferences hands us a bare UIViewController, so the grouped table the
+     * old table-view-controller subclass used to own is built here. */
+    _tableView = [[UITableView alloc] initWithFrame:self.view.bounds
+                                             style:UITableViewStyleGrouped];
+    _tableView.autoresizingMask =
+        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _tableView.backgroundColor = [UIColor groupTableViewBackgroundColor];
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    [self.view addSubview:_tableView];
+
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserver:self
+               selector:@selector(applicationWillResignActive:)
+                   name:UIApplicationWillResignActiveNotification
+                 object:nil];
+    [center addObserver:self
+               selector:@selector(applicationDidEnterBackground:)
+                   name:UIApplicationDidEnterBackgroundNotification
+                 object:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated
@@ -191,7 +212,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
      * read, and the window is not attached yet during viewWillAppear. */
     _signature = nil;
     [self refreshFromDiskReloading:NO];
-    [self.tableView reloadData];
+    [_tableView reloadData];
     [self startRefreshTimer];
 }
 
@@ -212,9 +233,31 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     /* Whatever was on screen is gone with the pane; start clean next time. */
     _alertCount = 0;
     _resumeAfterNotice = nil;
-    _pendingAuthorizedAction = nil;
+    [self clearAuthorization];
 
     [super viewWillDisappear:animated];
+}
+
+- (void)applicationWillResignActive:(NSNotification *)notification
+{
+    (void)notification;
+    /* Preferences.app stays resident: leaving the foreground must not leave
+     * the pane unlocked for the next person who opens Settings. */
+    [self clearAuthorization];
+}
+
+- (void)applicationDidEnterBackground:(NSNotification *)notification
+{
+    (void)notification;
+    [self clearAuthorization];
+}
+
+- (void)clearAuthorization
+{
+    _authorized = NO;
+    _pendingAuthorizedAction = nil;
+    _pendingPIN = nil;
+    _wizardPIN = nil;
 }
 
 #pragma mark - Live refresh
@@ -254,7 +297,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     _signature = signature;
 
     if (changed && reload && _alertCount == 0 && [self isViewLoaded] && self.view.window) {
-        [self.tableView reloadData];
+        [_tableView reloadData];
     }
 }
 
@@ -268,7 +311,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     NSNumber *debug = [_status objectForKey:@"DebugLogging"];
 
     return [NSString stringWithFormat:
-            @"%d|%d|%lld|%lld|%d|%d|%ld|%ld|%d|%d|%d|%ld|%ld|%ld|%ld",
+            @"%d|%d|%lld|%lld|%d|%d|%ld|%ld|%d|%d|%d|%ld|%ld|%ld|%ld|%d|%lld",
             _state.enabled, _state.phase, _state.remaining, _state.overrideUntil,
             _state.usageMinutes, _state.breakMinutes,
             (long)(pid ? [pid longLongValue] : -1),
@@ -277,7 +320,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
             (inert ? [inert boolValue] : 0),
             (debug ? [debug boolValue] : 0),
             (long)[_ipc hasPIN], (long)[_ipc requirePIN],
-            (long)[_ipc setupComplete], (long)[_ipc lockoutRemaining]];
+            (long)[_ipc setupComplete], (long)[_ipc lockoutRemaining],
+            [_ipc runtimeIsLive] ? 1 : 0, [self statusAgeSeconds]];
 }
 
 #pragma mark - State descriptions
@@ -311,37 +355,78 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     return NO;
 }
 
+/* The status file is written every few seconds; the disk State can lag by the
+ * persist throttle. Correct the published Remaining for the snapshot's age so
+ * both rows show what the overlay is counting down right now. NO when the
+ * snapshot has no numbers for the phase the pane is displaying. */
+- (BOOL)liveRemainingSeconds:(long long *)seconds
+{
+    NSNumber *phase = [_status objectForKey:@"Phase"];
+    NSNumber *remaining = [_status objectForKey:@"Remaining"];
+    NSNumber *tick = [_status objectForKey:@"LastTick"];
+
+    if (![phase isKindOfClass:[NSNumber class]] || [phase intValue] != _state.phase) return NO;
+    if (![remaining isKindOfClass:[NSNumber class]] ||
+        ![tick isKindOfClass:[NSNumber class]]) {
+        return NO;
+    }
+
+    long long value = [remaining longLongValue];
+    long long age = UGNowSeconds() - [tick longLongValue];
+    if (age > 0) value -= age;
+    if (value < 0) value = 0;
+    if (seconds) *seconds = value;
+    return YES;
+}
+
+- (long long)phaseSecondsLeft
+{
+    long long live = 0;
+    if ([self liveRemainingSeconds:&live]) return live;
+    return _state.remaining > 0 ? _state.remaining : 0;
+}
+
 - (long long)usageSecondsLeft
 {
     if (!_state.enabled) return 0;
-    if (_state.phase == UGPhaseUsage) return _state.remaining;
+    if (_state.phase == UGPhaseUsage) return [self phaseSecondsLeft];
     return (long long)_state.usageMinutes * 60;
 }
 
 - (long long)breakSecondsLeft
 {
     if (!_state.enabled) return 0;
-    return _state.phase == UGPhaseBreak ? _state.remaining : 0;
+    return _state.phase == UGPhaseBreak ? [self phaseSecondsLeft] : 0;
 }
 
 - (NSString *)runtimeDescription
 {
     if (![_ipc runtimeIsLive]) return @"Runtime: nu este detectat";
 
+    NSNumber *inert = [_status objectForKey:@"Inert"];
+    if (inert && [inert boolValue]) return @"Runtime: inactiv (pornit)";
+
     NSNumber *pid = [_status objectForKey:@"RuntimePID"];
     if (![pid isKindOfClass:[NSNumber class]]) return @"Runtime: nu este detectat";
     return [NSString stringWithFormat:@"Runtime: activ (pid %ld)", (long)[pid longLongValue]];
+}
+
+/* -1 when the status file has no heartbeat to age. */
+- (long long)statusAgeSeconds
+{
+    NSNumber *tick = [_status objectForKey:@"LastTick"];
+    if (![tick isKindOfClass:[NSNumber class]]) return -1;
+
+    long long age = UGNowSeconds() - [tick longLongValue];
+    return age < 0 ? 0 : age;
 }
 
 - (NSString *)statusAgeDescription
 {
     if (!_status) return @"fișier absent";
 
-    NSNumber *tick = [_status objectForKey:@"LastTick"];
-    if (![tick isKindOfClass:[NSNumber class]]) return @"necunoscut";
-
-    long long age = UGNowSeconds() - [tick longLongValue];
-    if (age < 0) age = 0;
+    long long age = [self statusAgeSeconds];
+    if (age < 0) return @"necunoscut";
     return [NSString stringWithFormat:@"actualizat acum %lld s", age];
 }
 
@@ -370,7 +455,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     if (version.length == 0) {
         version = [bundle objectForInfoDictionaryKey:@"CFBundleVersion"];
     }
-    return version.length > 0 ? version : kUGVersionString;
+    return version.length > 0 ? version : @UG_VERSION;
 }
 
 #pragma mark - Table structure
@@ -422,7 +507,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (UITableViewCell *)valueCellWithTitle:(NSString *)title detail:(NSString *)detail
 {
     UITableViewCell *cell =
-        [self.tableView dequeueReusableCellWithIdentifier:@"UGValueCell"];
+        [_tableView dequeueReusableCellWithIdentifier:@"UGValueCell"];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
                                      reuseIdentifier:@"UGValueCell"];
@@ -447,7 +532,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (UITableViewCell *)pathCellWithTitle:(NSString *)title detail:(NSString *)detail
 {
     UITableViewCell *cell =
-        [self.tableView dequeueReusableCellWithIdentifier:@"UGPathCell"];
+        [_tableView dequeueReusableCellWithIdentifier:@"UGPathCell"];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                      reuseIdentifier:@"UGPathCell"];
@@ -473,7 +558,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (UITableViewCell *)textCellWithTitle:(NSString *)title
 {
     UITableViewCell *cell =
-        [self.tableView dequeueReusableCellWithIdentifier:@"UGTextCell"];
+        [_tableView dequeueReusableCellWithIdentifier:@"UGTextCell"];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
                                      reuseIdentifier:@"UGTextCell"];
@@ -493,7 +578,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (UITableViewCell *)buttonCellWithTitle:(NSString *)title
 {
     UITableViewCell *cell =
-        [self.tableView dequeueReusableCellWithIdentifier:@"UGButtonCell"];
+        [_tableView dequeueReusableCellWithIdentifier:@"UGButtonCell"];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
                                      reuseIdentifier:@"UGButtonCell"];
@@ -517,7 +602,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
                                  enabled:(BOOL)enabled
 {
     UITableViewCell *cell =
-        [self.tableView dequeueReusableCellWithIdentifier:@"UGSwitchCell"];
+        [_tableView dequeueReusableCellWithIdentifier:@"UGSwitchCell"];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
                                      reuseIdentifier:@"UGSwitchCell"];
@@ -633,7 +718,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
             switch (indexPath.row) {
                 case kUGInformationRowVersion:
                     return [self valueCellWithTitle:@"Versiune Usage Guard"
-                                             detail:kUGVersionString];
+                                             detail:@UG_VERSION];
                 case kUGInformationRowRuntime:
                     return [self valueCellWithTitle:@"Runtime"
                                              detail:[self runtimeDescription]];
@@ -1216,6 +1301,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     BOOL saved = [self applyChange:^(UGState *state) {
         ug_set_usage_minutes(state, _wizardUsageMinutes);
         ug_set_break_minutes(state, _wizardBreakMinutes);
+        /* A fresh install still carries the 20-minute default allowance;
+         * without this reset the first interval would not match the chosen
+         * usage duration, whatever the confirmation says. */
+        ug_reset(state, UGNowSeconds());
         ug_set_enabled(state, 1, UGNowSeconds());
     }];
     if (!saved) return;

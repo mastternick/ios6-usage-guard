@@ -180,6 +180,45 @@ static void test_resume_clears_pause(void)
     CHECK(state.remaining == 20 * 60 - 105);
 }
 
+/*
+ * A resume that arrives while a break is paused must re-anchor the cycle: the
+ * parent action works on a disk snapshot whose lastWall can be a minute old, so
+ * without the anchor the first tick would subtract the whole pause from the
+ * break. The timer is deliberately not advanced tick by tick here.
+ */
+static void test_resume_during_break_does_not_spend_the_pause(void)
+{
+    UGState state;
+    long long now = 3300000;
+    long long resumeWall;
+
+    ug_state_defaults(&state, now);
+    ug_start_break(&state, now);
+    advance(&state, &now, 60, 1, 1);
+    CHECK(state.phase == UGPhaseBreak);
+    CHECK(state.remaining == 30 * 60 - 60);
+
+    ug_pause(&state, now, 10);
+    CHECK(!ug_is_locked(&state, now));
+
+    /* The pause lasts five minutes and no tick runs meanwhile: this is the
+     * stale snapshot a Settings-side resume actually sees. */
+    now += 5 * 60;
+    CHECK(state.remaining == 30 * 60 - 60);
+
+    resumeWall = now;
+    ug_resume(&state, now);
+    CHECK(state.overrideUntil == 0);
+    CHECK(state.lastWall == resumeWall);
+    CHECK(ug_is_locked(&state, now));
+
+    /* One second of real time costs exactly one second of the break. */
+    now = resumeWall + 1;
+    CHECK(ug_tick(&state, now, 1, 1) == UGEventNone);
+    CHECK(state.remaining == 30 * 60 - 60 - 1);
+    CHECK(ug_is_locked(&state, now));
+}
+
 static void test_resume_without_pause_changes_nothing(void)
 {
     UGState state;
@@ -722,6 +761,7 @@ int main(void)
     test_usage_gating();
     test_override_pause_resume();
     test_resume_clears_pause();
+    test_resume_during_break_does_not_spend_the_pause();
     test_resume_without_pause_changes_nothing();
     test_reset_and_start_break();
     test_clock_jumps();

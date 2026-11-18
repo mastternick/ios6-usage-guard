@@ -76,9 +76,12 @@ void ug_reset(UGState *state, long long now);
 void ug_start_break(UGState *state, long long now);
 void ug_pause(UGState *state, long long now, int minutes);
 
-/* Ends a pause immediately. Clears overrideUntil and nothing else: phase,
- * remaining, lastWall, durations and enabled keep their values, so the cycle
- * simply resumes from where the pause froze it. No-op when not paused. */
+/* Ends a pause immediately. Clears overrideUntil and re-anchors lastWall to
+ * `now`: the cycle was frozen while paused, so the first tick after a resume
+ * must count only the time since the resume — never the pause itself, which
+ * for a break would otherwise be subtracted from the countdown. Phase,
+ * remaining, durations and enabled keep their values, so the cycle simply
+ * resumes from where the pause froze it. No-op when not paused. */
 void ug_resume(UGState *state, long long now);
 void ug_set_enabled(UGState *state, int enabled, long long now);
 void ug_set_usage_minutes(UGState *state, int minutes);

@@ -10,6 +10,8 @@
 		<string>UsageGuardPrefs</string>
 		<key>detail</key>
 		<string>UGPreferencesController</string>
+		<key>isController</key>
+		<true/>
 		<key>label</key>
 		<string>Usage Guard</string>
 	</dict>

@@ -175,13 +175,16 @@ void ug_pause(UGState *state, long long now, int minutes)
 
 void ug_resume(UGState *state, long long now)
 {
-    /* `now` is part of the parent-action signature but a resume needs no
-     * re-anchoring: the next tick credits at most UG_MAX_CREDIT_SECONDS of the
-     * frozen gap, and ug_tick already forgot a backward clock jump. */
-    (void)now;
     if (!state) return;
     if (state->overrideUntil <= 0) return;
     state->overrideUntil = 0;
+    /* The whole cycle was frozen while paused, and the caller may hand in a
+     * stale lastWall (a resume from Settings works on a disk snapshot). Move
+     * the anchor to the resume, so the next tick only counts the time since
+     * it. This matters for breaks: unlike usage they are not capped at
+     * UG_MAX_CREDIT_SECONDS, so the pause would otherwise be subtracted from
+     * the break. */
+    state->lastWall = now;
 }
 
 void ug_set_enabled(UGState *state, int enabled, long long now)
