@@ -33,6 +33,8 @@ MAIN_DYLIB = "UsageGuard"
 PREFERENCE_BUNDLE = "UsageGuardPrefs"
 BUNDLE_DIR = "Library/PreferenceBundles/%s.bundle" % PREFERENCE_BUNDLE
 PREFERENCES_DIR = "Library/PreferenceLoader/Preferences"
+APP_BUNDLE_DIR = "Applications/UsageGuard.app"
+APP_BUNDLE_ID = "org.usageguard.timer.app"
 
 CONTROL_TEMPLATE = """Package: {package}
 Name: Synthetic
@@ -103,6 +105,33 @@ PREFERENCES_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 """
 
+# The /Applications bundle's Info.plist. CFBundleShortVersionString tracks the
+# control Version (CONTROL_TEMPLATE writes 0.0.1).
+APP_INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>CFBundleExecutable</key>
+\t<string>UsageGuard</string>
+\t<key>CFBundleIdentifier</key>
+\t<string>org.usageguard.timer.app</string>
+\t<key>CFBundlePackageType</key>
+\t<string>APPL</string>
+\t<key>CFBundleShortVersionString</key>
+\t<string>0.0.1</string>
+\t<key>MinimumOSVersion</key>
+\t<string>6.0</string>
+</dict>
+</plist>
+"""
+
+# The maintainer script: uicache is what makes the new app show up on the home
+# screen without a reboot, and Depends pulls uikittools in for it.
+POSTINST = """#!/bin/sh
+uicache -a >/dev/null 2>&1 || uicache >/dev/null 2>&1 || true
+exit 0
+"""
+
 
 # --------------------------------------------------------------------------- #
 # Synthetic Mach-O
@@ -161,7 +190,8 @@ def fat_wrap(slices):
 # Synthetic deb
 # --------------------------------------------------------------------------- #
 
-def tar_bytes(entries, with_dirs=False):
+def tar_bytes(entries, with_dirs=False, modes=None):
+    modes = modes or {}
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
         if with_dirs:
@@ -188,7 +218,7 @@ def tar_bytes(entries, with_dirs=False):
                 archive.addfile(info)
                 continue
             info.size = len(payload)
-            info.mode = 0o644
+            info.mode = modes.get(name, 0o644)
             info.mtime = 0
             archive.addfile(info, io.BytesIO(payload))
     return buffer.getvalue()
@@ -204,9 +234,19 @@ def ar_bytes(members):
     return bytes(out)
 
 
-def make_deb_dmpl(path, data_entries, control_text):
+def control_tar_bytes(control_text, postinst=None, postinst_mode=0o755):
+    """Build control.tar: ./control plus an optional ./postinst maintainer script."""
+    entries = [("./control", control_text.encode())]
+    modes = {}
+    if postinst is not None:
+        entries.append(("./postinst", postinst.encode()))
+        modes["./postinst"] = postinst_mode
+    return tar_bytes(entries, modes=modes)
+
+
+def make_deb_dmpl(path, data_entries, control_text, postinst=None):
     """Mirror Theos/dm.pl default: control.tar.gz + data.tar.lzma."""
-    control_tar = gzip.compress(tar_bytes([("./control", control_text.encode())]))
+    control_tar = gzip.compress(control_tar_bytes(control_text, postinst))
     data_tar = lzma.compress(tar_bytes(data_entries), format=lzma.FORMAT_ALONE)
     blob = ar_bytes([
         ("debian-binary", b"2.0\n"),
@@ -218,8 +258,9 @@ def make_deb_dmpl(path, data_entries, control_text):
     return path
 
 
-def make_deb(path, data_entries, control_text, compression="gz", with_dirs=False):
-    control_tar = tar_bytes([("./control", control_text.encode())])
+def make_deb(path, data_entries, control_text, compression="gz", with_dirs=False,
+             postinst=None, postinst_mode=0o755):
+    control_tar = control_tar_bytes(control_text, postinst, postinst_mode)
     data_tar = tar_bytes(data_entries, with_dirs=with_dirs)
     if compression == "gz":
         control_tar, data_tar = gzip.compress(control_tar), gzip.compress(data_tar)
@@ -262,14 +303,20 @@ PROBE_CONTROL = CONTROL_TEMPLATE.format(
     depends="mobilesubstrate, firmware (>= 6.0)",
 )
 
-# The main package: same tweak plus the Settings preference bundle.
+# The main package: the tweak, the Settings preference bundle and the
+# /Applications configuration app.
 MAIN_CONTROL = CONTROL_TEMPLATE.format(
     package="org.usageguard.timer",
     architecture="iphoneos-arm",
-    depends="mobilesubstrate, preferenceloader, firmware (>= 6.0)",
+    depends="mobilesubstrate, preferenceloader, uikittools, firmware (>= 6.0)",
 )
 
+APP_BINARY_KEY = "%s/UsageGuard" % APP_BUNDLE_DIR
+APP_INFO_PLIST_KEY = "%s/Info.plist" % APP_BUNDLE_DIR
+
 MAIN_ENTRIES = [
+    (APP_BINARY_KEY, macho(filetype=2, id_dylib=False)),
+    (APP_INFO_PLIST_KEY, APP_INFO_PLIST.encode()),
     ("%s/%s.dylib" % (DYLIB_DIR, MAIN_DYLIB), macho(install_base=MAIN_DYLIB)),
     ("%s/%s.plist" % (DYLIB_DIR, MAIN_DYLIB), FILTER_PLIST.encode()),
     ("%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE), macho(filetype=8, id_dylib=False)),
@@ -293,8 +340,14 @@ def with_entry(entries, path, payload):
 
 def cases(tmpdir):
     """Return [(name, deb_path, expect_exit, expected_substring, extra_argv)]."""
-    def deb(name, entries, control=GOOD_CONTROL, compression="gz", with_dirs=False):
-        return make_deb(os.path.join(tmpdir, name + ".deb"), entries, control, compression, with_dirs)
+    def deb(name, entries, control=GOOD_CONTROL, compression="gz", with_dirs=False, **kwargs):
+        return make_deb(os.path.join(tmpdir, name + ".deb"), entries, control,
+                        compression, with_dirs, **kwargs)
+
+    def main_deb(name, entries, control=MAIN_CONTROL, **kwargs):
+        """Main-layout package: carries the postinst unless a case overrides it."""
+        kwargs.setdefault("postinst", POSTINST)
+        return deb(name, entries, control=control, **kwargs)
 
     good = deb("good-gzip", GOOD_ENTRIES)
     good_lzma = deb("good-lzma", GOOD_ENTRIES, compression="lzma")
@@ -309,68 +362,87 @@ def cases(tmpdir):
     # Probe layout: identified by package id, two files.
     good_probe = deb("good-probe-layout", GOOD_ENTRIES, control=PROBE_CONTROL)
 
-    # Main layout: the five-file payload including the preference bundle.
-    good_main = deb("good-main-layout", MAIN_ENTRIES, control=MAIN_CONTROL, with_dirs=True)
-    main_extra_bundle_file = deb("bad-main-extra-bundle-file",
-                                 MAIN_ENTRIES + [("%s/Extra.strings" % BUNDLE_DIR, b"/* x */\n")],
-                                 control=MAIN_CONTROL)
-    main_probe_payload = deb("bad-main-two-file-payload", GOOD_ENTRIES, control=MAIN_CONTROL)
-    main_bundle_arm64 = deb("bad-main-bundle-arm64",
-                            with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
-                                       macho(cputype=22, cpusubtype=2, filetype=8, id_dylib=False)),
-                            control=MAIN_CONTROL)
-    main_bundle_unsigned = deb("bad-main-bundle-unsigned",
-                               with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
-                                          macho(filetype=8, id_dylib=False, code_signature=False)),
-                               control=MAIN_CONTROL)
+    # Main layout: the seven-file payload (tweak, preference bundle, app) plus
+    # the postinst maintainer script in control.tar.
+    good_main = main_deb("good-main-layout", MAIN_ENTRIES, with_dirs=True)
+    main_extra_bundle_file = main_deb("bad-main-extra-bundle-file",
+                                      MAIN_ENTRIES + [("%s/Extra.strings" % BUNDLE_DIR, b"/* x */\n")])
+    main_probe_payload = main_deb("bad-main-two-file-payload", GOOD_ENTRIES)
+    main_bundle_arm64 = main_deb("bad-main-bundle-arm64",
+                                 with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                            macho(cputype=22, cpusubtype=2, filetype=8, id_dylib=False)))
+    main_bundle_unsigned = main_deb("bad-main-bundle-unsigned",
+                                    with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                               macho(filetype=8, id_dylib=False, code_signature=False)))
     # Theos' bundle.mk default: -dynamiclib yields a MH_DYLIB with a stray
     # LC_ID_DYLIB. prefs/Makefile opts out with _DYNAMIC_LIBRARY = NO, so the
     # dylib-shaped executable must be rejected.
-    main_bundle_dylib = deb("bad-main-bundle-dylib",
-                            with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
-                                       macho(filetype=6, install_base=PREFERENCE_BUNDLE)),
-                            control=MAIN_CONTROL)
+    main_bundle_dylib = main_deb("bad-main-bundle-dylib",
+                                 with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                            macho(filetype=6, install_base=PREFERENCE_BUNDLE)))
     # A MH_BUNDLE that still carries an LC_ID_DYLIB was linked -dynamiclib
     # under another name; the install name betrays it.
-    main_bundle_id_dylib = deb("bad-main-bundle-id-dylib",
-                               with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
-                                          macho(filetype=8, install_base=PREFERENCE_BUNDLE)),
-                               control=MAIN_CONTROL)
-    main_bundle_exec = deb("bad-main-bundle-exec",
-                           with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
-                                      macho(filetype=2, id_dylib=False)),
-                           control=MAIN_CONTROL)
-    main_bad_prefs_plist = deb("bad-main-prefs-plist",
-                               with_entry(MAIN_ENTRIES, PREFS_PLIST_KEY,
-                                          PREFERENCES_PLIST.replace(PREFERENCE_BUNDLE, "OtherPrefs").encode()),
-                               control=MAIN_CONTROL)
-    main_no_iscontroller = deb("bad-main-no-iscontroller",
-                               with_entry(MAIN_ENTRIES, PREFS_PLIST_KEY,
-                                          PREFERENCES_PLIST.replace(
-                                              "\t\t<key>isController</key>\n\t\t<true/>\n", "").encode()),
-                               control=MAIN_CONTROL)
-    main_no_principal = deb("bad-main-no-principal-class",
-                            with_entry(MAIN_ENTRIES, INFO_PLIST_KEY,
-                                       INFO_PLIST.replace(
-                                           "\t<key>NSPrincipalClass</key>\n"
-                                           "\t<string>UGPreferencesController</string>\n", "").encode()),
-                            control=MAIN_CONTROL)
-    main_bad_executable = deb("bad-main-executable-mismatch",
-                              with_entry(MAIN_ENTRIES, INFO_PLIST_KEY,
-                                         INFO_PLIST.replace("<string>%s</string>" % PREFERENCE_BUNDLE,
-                                                            "<string>UsageGuard</string>", 1).encode()),
-                              control=MAIN_CONTROL)
-    main_bundle_minos = deb("bad-main-bundle-min-ios",
-                            with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
-                                       macho(filetype=8, id_dylib=False, min_os=(7, 0, 0))),
-                            control=MAIN_CONTROL)
-    main_no_preferenceloader = deb("bad-main-no-preferenceloader", MAIN_ENTRIES,
-                                   control=MAIN_CONTROL.replace("preferenceloader, ", ""))
-    # PreferenceLoader/PreferenceBundles packaging belongs to org.usageguard.timer;
-    # an empty directory tree must not slip into the two-file probe.
+    main_bundle_id_dylib = main_deb("bad-main-bundle-id-dylib",
+                                    with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                               macho(filetype=8, install_base=PREFERENCE_BUNDLE)))
+    main_bundle_exec = main_deb("bad-main-bundle-exec",
+                                with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                           macho(filetype=2, id_dylib=False)))
+    main_bad_prefs_plist = main_deb("bad-main-prefs-plist",
+                                    with_entry(MAIN_ENTRIES, PREFS_PLIST_KEY,
+                                               PREFERENCES_PLIST.replace(PREFERENCE_BUNDLE,
+                                                                         "OtherPrefs").encode()))
+    main_no_iscontroller = main_deb("bad-main-no-iscontroller",
+                                    with_entry(MAIN_ENTRIES, PREFS_PLIST_KEY,
+                                               PREFERENCES_PLIST.replace(
+                                                   "\t\t<key>isController</key>\n\t\t<true/>\n",
+                                                   "").encode()))
+    main_no_principal = main_deb("bad-main-no-principal-class",
+                                 with_entry(MAIN_ENTRIES, INFO_PLIST_KEY,
+                                            INFO_PLIST.replace(
+                                                "\t<key>NSPrincipalClass</key>\n"
+                                                "\t<string>UGPreferencesController</string>\n",
+                                                "").encode()))
+    main_bad_executable = main_deb("bad-main-executable-mismatch",
+                                   with_entry(MAIN_ENTRIES, INFO_PLIST_KEY,
+                                              INFO_PLIST.replace("<string>%s</string>" % PREFERENCE_BUNDLE,
+                                                                 "<string>UsageGuard</string>", 1).encode()))
+    main_bundle_minos = main_deb("bad-main-bundle-min-ios",
+                                 with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                            macho(filetype=8, id_dylib=False, min_os=(7, 0, 0))))
+    main_no_preferenceloader = main_deb("bad-main-no-preferenceloader", MAIN_ENTRIES,
+                                        control=MAIN_CONTROL.replace("preferenceloader, ", ""))
+    main_no_uikittools = main_deb("bad-main-no-uikittools", MAIN_ENTRIES,
+                                  control=MAIN_CONTROL.replace("uikittools, ", ""))
+
+    # The configuration app: an /Applications bundle, so it must be an
+    # MH_EXECUTE (never a dylib), signed, and identified by its own Info.plist.
+    main_app_dylib = main_deb("bad-main-app-dylib",
+                              with_entry(MAIN_ENTRIES, APP_BINARY_KEY,
+                                         macho(filetype=6, install_base="UsageGuard")))
+    main_app_unsigned = main_deb("bad-main-app-unsigned",
+                                 with_entry(MAIN_ENTRIES, APP_BINARY_KEY,
+                                            macho(filetype=2, id_dylib=False, code_signature=False)))
+    main_app_bad_id = main_deb("bad-main-app-bundle-id",
+                               with_entry(MAIN_ENTRIES, APP_INFO_PLIST_KEY,
+                                          APP_INFO_PLIST.replace(APP_BUNDLE_ID,
+                                                                 "org.usageguard.timer").encode()))
+    main_extra_app_file = main_deb("bad-main-extra-app-file",
+                                   MAIN_ENTRIES + [("%s/Extra.txt" % APP_BUNDLE_DIR, b"x\n")])
+
+    # Maintainer script: dpkg needs it present, executable and calling uicache.
+    main_no_postinst = main_deb("bad-main-no-postinst", MAIN_ENTRIES, postinst=None)
+    main_postinst_not_executable = main_deb("bad-main-postinst-not-executable", MAIN_ENTRIES,
+                                            postinst_mode=0o644)
+
+    # PreferenceLoader/PreferenceBundles/Applications packaging belongs to
+    # org.usageguard.timer; none of it may slip into the two-file probe.
     probe_pref_dirs = deb("bad-probe-preference-dirs",
                           GOOD_ENTRIES + [("Library/PreferenceLoader/Preferences/", None)],
                           control=PROBE_CONTROL)
+    probe_app_dir = deb("bad-probe-applications-dir",
+                        GOOD_ENTRIES + [("Applications/", None)],
+                        control=PROBE_CONTROL)
 
     wrong_arch = deb("bad-arch-arm64", [(GOOD_ENTRIES[0][0], macho(cputype=22, cpusubtype=2)),
                                         GOOD_ENTRIES[1]])
@@ -424,7 +496,8 @@ def cases(tmpdir):
         ("valid package (dpkg-style dir entries)", good_dirs, 0, "PASS", []),
         ("valid package (single-slice fat armv7)", good_fat1, 0, "single-slice fat", []),
         ("valid package (dm.pl control.gz + data.lzma)", good_dmpl, 0, "PASS", []),
-        ("main layout with the full five-file payload accepted", good_main, 0, "5 files", []),
+        ("main layout with the full seven-file payload and postinst accepted", good_main, 0,
+         "7 files", []),
         ("probe layout accepted for the probe package", good_probe, 0,
          "MobileSubstrate dylib + filter plist", []),
         ("probe layout accepted with --expect-package probe", good_probe, 0,
@@ -457,6 +530,22 @@ def cases(tmpdir):
          "only allowed in package org.usageguard.timer", []),
         ("main package missing preferenceloader rejected", main_no_preferenceloader, 1,
          "control: Depends preferenceloader", []),
+        ("main package missing uikittools rejected", main_no_uikittools, 1,
+         "control: Depends uikittools", []),
+        ("app executable as MH_DYLIB rejected", main_app_dylib, 1,
+         "filetype is 6 (MH_DYLIB), expected 2 (MH_EXECUTE)", []),
+        ("unsigned app binary rejected", main_app_unsigned, 1,
+         "app binary signed", []),
+        ("app Info.plist with the wrong bundle id rejected", main_app_bad_id, 1,
+         "CFBundleIdentifier is 'org.usageguard.timer'", []),
+        ("extra file inside UsageGuard.app rejected", main_extra_app_file, 1,
+         "unexpected: %s/Extra.txt" % APP_BUNDLE_DIR, []),
+        ("main package without postinst rejected", main_no_postinst, 1,
+         "postinst present", []),
+        ("non-executable postinst rejected", main_postinst_not_executable, 1,
+         "postinst is executable", []),
+        ("probe package with an Applications/ directory rejected", probe_app_dir, 1,
+         "only allowed in package org.usageguard.timer", []),
         ("arm64 slice rejected", wrong_arch, 1, "CPU_TYPE_ARM", []),
         ("armv7s subtype rejected", armv7s, 1, "CPU_SUBTYPE_ARM_V7", []),
         ("fat binary rejected", fat, 1, "universal (fat) Mach-O", []),

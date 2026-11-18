@@ -7,10 +7,11 @@ repeating **use / break** cycle:
 * then a mandatory 30-minute break with a full-screen lock overlay,
 * repeat indefinitely.
 
-Both durations are configurable from a PIN-protected parent panel and from the
-**Usage Guard** pane in Settings. The tweak runs inside SpringBoard, so the break
-overlay appears above apps, the home screen, notifications and alerts regardless
-of what is in the foreground.
+Both durations are configurable from a PIN-protected parent panel, from the
+**Usage Guard** pane in Settings, and from the **Usage Guard** app on the home
+screen (the same pane, in a second host). The tweak runs inside SpringBoard, so
+the break overlay appears above apps, the home screen, notifications and alerts
+regardless of what is in the foreground.
 
 ## What it looks like
 
@@ -95,8 +96,12 @@ Clock rules on every tick:
 The package also installs a preference bundle
 (`/Library/PreferenceBundles/UsageGuardPrefs.bundle`) plus a PreferenceLoader
 entry (`/Library/PreferenceLoader/Preferences/UsageGuard.plist`), so a
-**Usage Guard** row appears at the bottom of `Settings`. There is no app icon:
-the pane lives in Settings. The entry is a real controller (`isController` plus
+**Usage Guard** row appears at the bottom of `Settings`. The pane is the
+Settings half of the configuration UI; the package also installs a
+home-screen app that shows the same pane (see
+[Configuration app](#configuration-app)), which is the fallback when
+Preferences.app itself is not usable. The entry is a real controller
+(`isController` plus
 `detail` in the entry plist, `NSPrincipalClass` in the bundle's `Info.plist`),
 so tapping the row pushes `UGPreferencesController` — a `PSViewController`
 subclass that builds its own grouped table view — instead of a dead link cell.
@@ -108,7 +113,7 @@ The pane has five sections, top to bottom:
 | **Time Limits** | `Utilizare (minute)` and `Pauză (minute)`, 1–240 each, edited through a prompt |
 | **Actions** | `Începe pauza acum`, `Resetează ciclul`, `Pauză 15 min`, `Pauză 30 min`, `Pauză 60 min`, `Reia restricțiile`, `Testează ecranul de blocare` |
 | **Security** | `Schimbă codul PIN` (`Setează un cod PIN` when none is stored) and the `Cere PIN pentru modificări` switch |
-| **Information** | tweak version, runtime, bundle version, preferences path, status-file age, kill-switch state, `DebugLogging` state |
+| **Information** | tweak version, runtime, bundle version, preferences path, `Jurnal` (trace path and size), status-file age, kill-switch state, `DebugLogging` state, `Șterge jurnalul` |
 
 The pane keeps no copy of the state: every read reloads the preferences file and
 every change is a read-modify-write that is announced to SpringBoard (see
@@ -124,6 +129,63 @@ modificări` defaults to on, which makes every row that changes the cycle or the
 PIN ask for the PIN first; the test-overlay row never asks, because it changes
 nothing. `Reia restricțiile` is the way out of a parent pause: it clears the
 pause immediately instead of waiting for it to expire.
+
+## Configuration app
+
+The package installs a small companion app next to the tweak:
+
+| | |
+| --- | --- |
+| bundle | `/Applications/UsageGuard.app` |
+| bundle id | `org.usageguard.timer.app` |
+| executable | `UsageGuard` (armv7, signed like the other binaries) |
+| icon | **Usage Guard** on the home screen |
+
+It is a **jailbreak app that the .deb installs into `/Applications`** — not an
+IPA, and not a sandboxed App Store app. That is deliberate. A sandboxed app gets
+its own container, so it cannot read
+`/var/mobile/Library/Preferences/org.usageguard.timelock.plist`, which is where
+the cycle state and the PIN vault live; it also could not reuse the pane's
+`PSViewController` base class. And it could not be distributed through the App
+Store at all, because it is the companion of a MobileSubstrate tweak. The only
+delivery route is the jailbreak package itself, which is why the app travels
+inside the same `.deb` (and why `Depends` lists `uikittools`: the `postinst`
+runs `uicache`).
+
+The app is **the configuration UI, not the enforcer**. It hosts the identical
+`UGPreferencesController` the Settings pane uses — same
+`initForContentSize:` initialiser, same rows — wrapped in a navigation
+controller, so nothing can drift between the two hosts. SpringBoard's tweak
+still does all the accounting, the overlay and the PIN work.
+
+The app keeps no state of its own. It reads and writes the **same preferences
+file** (`/var/mobile/Library/Preferences/org.usageguard.timelock.plist`) and
+posts the **same Darwin notifications** as the pane
+(`org.usageguard.timer.settingschanged` after a save,
+`org.usageguard.timer.testoverlay` for the preview), so a change made in the app
+is picked up by SpringBoard exactly like one made in Settings. It also reloads
+the file once a second, so changes made from the break overlay's parent panel
+show up the same way. Backgrounding or closing the app changes nothing: the
+tweak enforces from SpringBoard.
+
+Launch it from the home screen. The icon appears after the package's `postinst`
+runs `uicache`; without that (or a reboot) iOS 6 has not registered the new
+bundle yet and the icon is missing. If the icon is missing, run `uicache` again
+or respring — the app is installed either way:
+
+```sh
+uicache -a
+# or
+killall -9 SpringBoard
+```
+
+Use it when the Settings pane misbehaves: a row that does not push, a
+Preferences.app that closes as soon as it opens, or a device where the pane
+cannot be reached at all. The app writes the same local trace
+(`/var/mobile/Library/Preferences/org.usageguard.timer.trace.log`, same format;
+see [Local trace](#local-trace-settings-pane)), with `app:` lines around the
+window setup, so a trace exported from the app shows whether the failure is in
+the controller or in Preferences.app.
 
 ## First-run setup
 
@@ -142,8 +204,10 @@ is still `0`. A preferences file from an earlier release is treated as set up �
 upgrading does not re-run the wizard; a device that never stored a PIN still
 gets the first-run wizard.
 
-Setup runs from Settings → Usage Guard: the wizard opens the first time the pane
-is shown. The overlay's seven-tap parent panel is *not* a setup path — the
+Setup runs from Settings → Usage Guard (or from the **Usage Guard** app on the
+home screen, which hosts the same pane — see
+[Configuration app](#configuration-app)): the wizard opens the first time the
+pane is shown. The overlay's seven-tap parent panel is *not* a setup path — the
 overlay only appears once a break is running or through `Testează ecranul de
 blocare`, and neither can happen before setup. The wizard asks for the PIN
 twice, then the usage and break durations, explains the emergency valve, and
@@ -206,6 +270,56 @@ device and open it with `plutil` or Xcode on the desktop. `RuntimePID` and
 answer "what does it think the cycle is doing?". A stale `LastTick` after a
 respring is expected until the new runtime writes its first snapshot.
 
+### Local trace (Settings pane)
+
+The pane cannot be observed without SSH: Preferences.app is a separate process
+and its crash reports are not reachable from a desktop sync tool. The 1.0.4
+bundle therefore keeps its own trace at
+
+```
+/var/mobile/Library/Preferences/org.usageguard.timer.trace.log
+```
+
+and writes one line per event:
+
+```
+<epoch seconds> <ISO-8601 UTC> [<pid>] <text>
+```
+
+`pid` is the process that wrote the line — Preferences.app for the pane, and a
+fresh pid after every respring, which is how a restart can be told from a crash
+in the same session. The bundle records, in order: the bundle path it was loaded
+from, `+load` of the controller, `initForContentSize:` (with the result of
+`respondsToSelector:` for `setSpecifier:`, `setRootController:`,
+`setParentController:` and `viewWillBecomeVisible:`), `loadView`, table
+installation, `viewDidLoad`, `viewWillAppear:`, `viewDidAppear:` (with
+`setupComplete` and `hasPIN`), `viewWillDisappear:`, `dealloc`, every table cell
+built (section and row only - never cell text), every row selection, every
+action handler, every alert presented and dismissed (tag and button index), and
+`clearAuthorization` (including whether an alert was live). It also installs an
+`NSSetUncaughtExceptionHandler`, so an uncaught exception appends
+
+```
+EXCEPTION <name>: <reason>
+  stack[0] <symbol>
+  ...
+```
+
+before the process dies - which is exactly the information a "Settings closes
+when I tap Usage Guard" report lacks.
+
+The log is **local to the device**; nothing is uploaded or sent anywhere. It is
+capped: once it passes 64 KB the file is emptied before the next line is
+written, so it cannot fill the preferences directory. It is written per line
+(open/append/close) so any thread can use it and a crash cannot leave the file
+locked; a write failure is silent by design.
+
+To read it, copy the file off with 3uTools (or any desktop file browser that can
+see `/var/mobile/Library/Preferences/`). The Information section of the pane
+shows the same path and the current size in the `Jurnal` row, and the
+`Șterge jurnalul` row at the end of that section deletes the file (the row then
+reads `absent sau gol`).
+
 ## Test overlay
 
 `Testează ecranul de blocare` (Actions) posts
@@ -239,16 +353,21 @@ while a break is still active.
 ## Repository layout
 
 ```
-Makefile                Theos build: the tweak plus the preference bundle
+Makefile                Theos build: the tweak, the preference bundle and the app
 control                 Debian package metadata
 UsageGuard.plist        MobileSubstrate filter (com.apple.springboard)
 Tweak.x                single SpringBoard bootstrap hook
 layout/Library/PreferenceLoader/Preferences/UsageGuard.plist
                         PreferenceLoader entry (the Settings row)
+layout/DEBIAN/postinst  maintainer script: runs uicache so the app icon appears
 prefs/                  preference bundle sources and resources
 prefs/Resources/Info.plist  the bundle's Info.plist (staged into the bundle)
-prefs/UGPreferencesController.{h,m}  the grouped Settings pane
+prefs/UGPreferencesController.{h,m}  the grouped Settings pane (shared with the app)
+prefs/UGTrace.{h,m}                  line-oriented trace log + uncaught-exception record
 prefs/UGSettingsIPC.{h,m}            plist access and Darwin announcements
+app/                    the /Applications configuration app
+app/Resources/Info.plist      the app's Info.plist (staged into the bundle)
+app/main.m, app/UGAppDelegate.{h,m}  window + navigation controller hosting the pane
 src/UGGuardCore.{h,c}   pure C cycle engine, serialization, MM:SS formatting
 src/UGPrefs.{h,m}       plist persistence + PBKDF2 PIN vault and rate limit
 src/UGNotify.h          the three Darwin notification names
@@ -272,12 +391,13 @@ uses no allocation and its serialized state is bounded well below 512 bytes.
 The supported path is the CI pipeline in `.github/workflows/build.yml`. It runs
 on every push to `main` and on manual `workflow_dispatch`, installs Theos with
 the iPhoneOS 6.1 SDK and a 32-bit-capable LLVM toolchain on a GitHub-hosted
-Ubuntu runner, builds the probe tweak first, then this tweak and its preference
-bundle, statically validates both packages, and uploads:
+Ubuntu runner, builds the probe tweak first, then this tweak with its preference
+bundle and the `/Applications` app, statically validates both packages, and
+uploads:
 
 | artifact | contents |
 | --- | --- |
-| `usage-guard-deb` | `org.usageguard.timer_1.0.3_iphoneos-arm.deb` — install this |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.4_iphoneos-arm.deb` — install this |
 | `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
 | `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
 
@@ -289,9 +409,10 @@ gh run download --name usage-guard-deb
 ```
 
 Validation is enforced, not advisory: before building, the pipeline fails unless
-`control`, the bundle's `Info.plist` (`prefs/Resources/Info.plist`, the file
-Theos stages into the bundle) and `src/UGVersion.h` all carry the same version,
-and unless the pane takes that version from the header — a hard-coded `1.0.3`
+`control`, the preference bundle's `Info.plist` (`prefs/Resources/Info.plist`,
+the file Theos stages into the bundle), the app's `Info.plist`
+(`app/Resources/Info.plist`) and `src/UGVersion.h` all carry the same version,
+and unless the pane takes that version from the header — a hard-coded `1.0.4`
 literal in `prefs/UGPreferencesController.m` or `prefs/UGSettingsIPC.m` fails
 the build. The same step also fails if
 `org.usageguard.timelock.plist`, `org.usageguard.timer.status.plist` or
@@ -300,13 +421,17 @@ outside `src/UGVersion.h`, so the release version and those plist paths have
 exactly one definition.
 The validator then fails the package unless
 
-* the payload is exactly five files — the armv7 `MH_DYLIB` and its filter plist
-  under `Library/MobileSubstrate/DynamicLibraries/`, the armv7 `MH_BUNDLE`
-  executable (`UsageGuardPrefs`, filetype 8) and its `Info.plist` under
-  `Library/PreferenceBundles/UsageGuardPrefs.bundle/`, and the PreferenceLoader
-  entry `Library/PreferenceLoader/Preferences/UsageGuard.plist` (the bundle is
-  linked `-bundle` with `_DYNAMIC_LIBRARY = NO`, so the validator rejects a
-  dylib-shaped bundle executable, including one carrying an `LC_ID_DYLIB`);
+* the payload is exactly seven files — the armv7 `MH_EXECUTE` `UsageGuard` and
+  its `Info.plist` under `Applications/UsageGuard.app/`, the armv7 `MH_DYLIB`
+  and its filter plist under `Library/MobileSubstrate/DynamicLibraries/`, the
+  armv7 `MH_BUNDLE` executable (`UsageGuardPrefs`, filetype 8) and its
+  `Info.plist` under `Library/PreferenceBundles/UsageGuardPrefs.bundle/`, and
+  the PreferenceLoader entry `Library/PreferenceLoader/Preferences/UsageGuard.plist`
+  (the bundle is linked `-bundle` with `_DYNAMIC_LIBRARY = NO`, so the
+  validator rejects a dylib-shaped bundle executable, including one carrying an
+  `LC_ID_DYLIB`);
+* the app `Info.plist` names `org.usageguard.timer.app` with executable
+  `UsageGuard` and the package version in `CFBundleShortVersionString`;
 * the filter plist names `com.apple.springboard` and the PreferenceLoader plist
   names the `UsageGuardPrefs` bundle;
 * the PreferenceLoader entry is a real controller — `entry.isController` is
@@ -315,16 +440,19 @@ The validator then fails the package unless
 * the bundle's `Info.plist` declares `CFBundleExecutable` (`UsageGuardPrefs`,
   the binary that must exist) and a non-empty `NSPrincipalClass` (the class
   PreferenceLoader instantiates; the two keys are independent and may differ);
-* both binaries are single-slice **armv7**, `LC_VERSION_MIN_IPHONEOS` 6.0.0 and
-  signed (`LC_CODE_SIGNATURE`); the bundle executable carries no `LC_ID_DYLIB`;
-* `Architecture: iphoneos-arm` and `Depends:` list `mobilesubstrate` and
-  `preferenceloader`.
+* all three binaries are single-slice **armv7**, `LC_VERSION_MIN_IPHONEOS` 6.0.0
+  and signed (`LC_CODE_SIGNATURE`); the bundle executable carries no
+  `LC_ID_DYLIB`;
+* `control.tar` carries an executable (`0755`) `postinst` that runs `uicache`,
+  so the app icon appears without a reboot;
+* `Architecture: iphoneos-arm` and `Depends:` list `mobilesubstrate`,
+  `preferenceloader` and `uikittools`.
 
 The probe package keeps its own two-file payload (dylib plus filter plist)
 whose only dependency is `mobilesubstrate`; the validator checks each layout
-separately, and it rejects `Library/PreferenceLoader` or
-`Library/PreferenceBundles` content — even an empty directory — in any package
-other than `org.usageguard.timer`.
+separately, and it rejects `Library/PreferenceLoader`,
+`Library/PreferenceBundles` or `Applications` content — even an empty
+directory — in any package other than `org.usageguard.timer`.
 
 ### Local build (optional, requires your own toolchain)
 
@@ -335,7 +463,7 @@ make package FINALPACKAGE=1
 ```
 
 The package is written to `packages/` as
-`org.usageguard.timer_1.0.3_iphoneos-arm.deb`. The tweak targets
+`org.usageguard.timer_1.0.4_iphoneos-arm.deb`. The tweak targets
 `iphone:clang:6.1:6.0`, `ARCHS = armv7` (iPhone 4S / iPad 2 class hardware).
 
 ### Host tests (no Theos, no device)
@@ -361,22 +489,38 @@ Copy the built `.deb` to the device and install it with dpkg, then respring or
 restart SpringBoard:
 
 ```sh
-scp packages/org.usageguard.timer_1.0.3_iphoneos-arm.deb root@DEVICE_IP:/var/root/
+scp packages/org.usageguard.timer_1.0.4_iphoneos-arm.deb root@DEVICE_IP:/var/root/
 ssh root@DEVICE_IP \
-  'dpkg -i /var/root/org.usageguard.timer_1.0.3_iphoneos-arm.deb && killall -9 SpringBoard'
+  'dpkg -i /var/root/org.usageguard.timer_1.0.4_iphoneos-arm.deb && killall -9 SpringBoard'
 ```
 
 A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'
 deb installer) works the same way. The package installs the tweak
 (`/Library/MobileSubstrate/DynamicLibraries/UsageGuard.dylib` and its filter
 plist), the preference bundle
-(`/Library/PreferenceBundles/UsageGuardPrefs.bundle/`) and the PreferenceLoader
-entry (`/Library/PreferenceLoader/Preferences/UsageGuard.plist`), and it
-declares `Depends: mobilesubstrate, preferenceloader, firmware (>= 6.0)`. Cydia
-and dpkg refuse the install without PreferenceLoader, which is what puts the
-pane in Settings. After installation the tweak starts with SpringBoard; there is
-no app icon — the pane lives in Settings → Usage Guard, and until the first-run
-setup is completed nothing is enforced.
+(`/Library/PreferenceBundles/UsageGuardPrefs.bundle/`), the PreferenceLoader
+entry (`/Library/PreferenceLoader/Preferences/UsageGuard.plist`) and the
+configuration app (`/Applications/UsageGuard.app/`), and it declares
+`Depends: mobilesubstrate, preferenceloader, uikittools, firmware (>= 6.0)`.
+Cydia and dpkg refuse the install without PreferenceLoader (which puts the pane
+in Settings) or without uikittools (which provides `uicache`, used by the
+package's `postinst`). After installation the tweak starts with SpringBoard and
+a **Usage Guard** icon appears on the home screen once `uicache` has run; both
+the icon and the Settings row open the same configuration UI, and until the
+first-run setup is completed nothing is enforced.
+
+If the icon does not appear, the bundle is installed but SpringBoard has not
+rescanned `/Applications` yet — run `uicache -a` over SSH or respring:
+
+```sh
+ssh root@DEVICE_IP 'uicache -a'
+# or
+ssh root@DEVICE_IP 'killall -9 SpringBoard'
+```
+
+To update, install the newer `.deb` over the old one the same way
+(`dpkg -i`); the postinst runs `uicache` again, so the icon and version refresh
+without a reboot, and the preferences file is preserved.
 
 To remove it: `dpkg -r org.usageguard.timer` (or `dpkg -P`) followed by a
 respring. The preferences file `org.usageguard.timelock.plist` lives in the
@@ -430,6 +574,17 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   fails the build when any of them is missing. If the row is there but the
   Status section reports no live runtime, SpringBoard has not injected the tweak
   or was restarted since — see Diagnostics above.
+* **No Usage Guard icon on the home screen.** The app is installed by the
+  package, but iOS 6 only registers a new `/Applications` bundle after
+  `uicache` (run by the package's `postinst`) or a reboot. Run `uicache -a` or
+  respring; `uikittools` is a declared dependency, so `uicache` should already
+  be on the device.
+* **Settings closes when the pane opens, or the pane cannot be reached.** Use
+  the **Usage Guard** app on the home screen: it hosts the identical
+  `UGPreferencesController`, so every row works the same and a change is
+  announced to SpringBoard the same way. Both hosts append to
+  `/var/mobile/Library/Preferences/org.usageguard.timer.trace.log`; copy it off
+  the device to see which host got how far.
 
 ## Limitations (honest list)
 
@@ -498,10 +653,18 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   `lockstate` fires on both lock and unlock. When no source can answer, the
   tweak assumes "locked, screen off": it neither counts usage nor covers the
   screen on a guess. No private method ABI is assumed at compile time.
+* **The app is jailbreak software, not an App Store app.** It is installed into
+  `/Applications` by the package and signed with `ldid`; there is no IPA, no
+  provisioning profile and no way to load it on a stock device, because it
+  needs the tweak's rootful preferences file. It also only configures: with the
+  tweak uninstalled the app opens and shows the persisted state, but nothing
+  is enforced.
 * **No physical-device test was performed for this release.** CI cross-builds
   the package, `scripts/validate_deb.py` checks the payload statically and the
   host C tests cover the cycle engine; nothing in this repository exercises the
-  Settings pane, the status file, the Darwin notifications or the overlay on
-  hardware. Runtime behaviour must be smoke-tested on a real jailbroken iOS
-  6.1.3 device: respring, overlay over several apps, lock/unlock, the emergency
-  call, PIN lockout, a Settings round-trip and the test overlay.
+  Settings pane, the configuration app, the status file, the Darwin
+  notifications or the overlay on hardware. Runtime behaviour must be
+  smoke-tested on a real jailbroken iOS 6.1.3 device: respring, the home-screen
+  icon after `uicache`, overlay over several apps, lock/unlock, the emergency
+  call, PIN lockout, a Settings round-trip, the same round-trip from the app and
+  the test overlay.

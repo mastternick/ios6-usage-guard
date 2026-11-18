@@ -1,0 +1,10 @@
+#!/bin/sh
+# Refresh the SpringBoard icon cache so the Usage Guard app appears on the home
+# screen immediately, without a reboot (iOS 6 registers /Applications apps only
+# after uicache or a respring).
+#
+# Nothing here may fail the install: a missing uicache is not worth an error, and
+# the worst case is a blank icon until the next respring.
+uicache -a >/dev/null 2>&1 || uicache >/dev/null 2>&1 || true
+
+exit 0

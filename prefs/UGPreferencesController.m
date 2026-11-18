@@ -3,6 +3,7 @@
 #import "UGGuardCore.h"
 #import "UGPrefs.h"
 #import "UGSettingsIPC.h"
+#import "UGTrace.h"
 #import "UGVersion.h"
 
 /* Section order, matching the pane from top to bottom. */
@@ -52,10 +53,12 @@ enum {
     kUGInformationRowRuntime = 1,
     kUGInformationRowBundleVersion = 2,
     kUGInformationRowPreferencesPath = 3,
-    kUGInformationRowStatusAge = 4,
-    kUGInformationRowKillSwitch = 5,
-    kUGInformationRowDebugLogging = 6,
-    kUGInformationRowCount = 7
+    kUGInformationRowTraceLog = 4,
+    kUGInformationRowStatusAge = 5,
+    kUGInformationRowKillSwitch = 6,
+    kUGInformationRowDebugLogging = 7,
+    kUGInformationRowClearTraceLog = 8,
+    kUGInformationRowCount = 9
 };
 
 /* Switch tags survive cell reuse; the action stays attached to the switch. */
@@ -131,17 +134,44 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     return YES;
 }
 
+#ifdef UG_HOST_APP
+
+/*
+ * Standalone app host. PreferenceLoader usually supplies the initializer that
+ * takes a content size; without it the app instantiates the pane through this
+ * base, which is nothing more than UIViewController plus that entry point.
+ */
+@implementation UGControllerBase
+
+- (id)initForContentSize:(CGSize)size
+{
+    /* The size is advisory: the pane sizes its container from it but the app's
+     * navigation controller lays the view out again. */
+    (void)size;
+    return [super initWithNibName:nil bundle:nil];
+}
+
+@end
+
+#endif /* UG_HOST_APP */
+
 @implementation UGPreferencesController {
     UGSettingsIPC *_ipc;
 
     UITableView *_tableView;
+    CGSize _contentSize;
+    BOOL _notificationsInstalled;
     UGState _state;
     NSDictionary *_status;
     NSString *_signature;
     NSTimer *_refreshTimer;
 
     NSInteger _alertCount;
-    UIAlertView *_activeAlert;
+
+    /* Weak on purpose: Preferences can dismiss and release an alert while the
+     * pane still holds a reference. A stale strong pointer would then be
+     * messaged after deallocation; a weak one simply reads back nil. */
+    __weak UIAlertView *_activeAlert;
     void (^_resumeAfterNotice)(void);
 
     BOOL _authorized;
@@ -157,57 +187,177 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 #pragma mark - Lifecycle
 
++ (void)load
+{
+    /* Runs when Preferences dlopen()s the bundle: the first trace line names
+     * the copy of UsageGuardPrefs.bundle the host actually loaded. */
+    UGTrace(@"controller class loaded from %@",
+            [[NSBundle bundleForClass:self] bundlePath]);
+}
+
 - (id)initForContentSize:(CGSize)size
 {
+    UGTrace(@"initForContentSize: entry %.0fx%.0f", size.width, size.height);
+
     self = [super initForContentSize:size];
     if (!self) return nil;
+
+    /* Kept for the container frame in loadView; the host may pass a zero size
+     * when it builds the controller before the window exists. */
+    _contentSize = (size.width > 0.0f && size.height > 0.0f)
+                   ? size : CGSizeMake(320.0f, 480.0f);
 
     _ipc = [[UGSettingsIPC alloc] init];
     ug_state_defaults(&_state, UGNowSeconds());
     _wizardStep = kUGWizardStepIdle;
     self.title = @"Usage Guard";
 
+    /* The four probes name selectors the Settings host may or may not have.
+     * They are built from strings so this translation unit compiles unchanged
+     * in the standalone app, where none of them is declared; the values and the
+     * trace line are the same in both hosts. */
+    UGTrace(@"initForContentSize: exit setSpecifier=%d setRootController=%d "
+             "setParentController=%d viewWillBecomeVisible=%d ipc=%d",
+            (int)[self respondsToSelector:NSSelectorFromString(@"setSpecifier:")],
+            (int)[self respondsToSelector:NSSelectorFromString(@"setRootController:")],
+            (int)[self respondsToSelector:NSSelectorFromString(@"setParentController:")],
+            (int)[self respondsToSelector:NSSelectorFromString(@"viewWillBecomeVisible:")],
+            (int)(_ipc != nil));
+
     return self;
 }
 
 - (void)dealloc
 {
+    /* One last line on the way out. _activeAlert is never messaged here: it is
+     * weak, so it is either valid or already nil, and dismissing it is not this
+     * object's job once it is deallocating. */
+    UGTrace(@"dealloc: pane released");
+
     [_refreshTimer invalidate];
     _refreshTimer = nil;
 
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
-- (void)viewDidLoad
+- (void)loadView
 {
-    [super viewDidLoad];
+    UGTrace(@"loadView: entry");
 
-    /* Preferences hands us a bare UIViewController, so the grouped table the
-     * old table-view-controller subclass used to own is built here. */
-    _tableView = [[UITableView alloc] initWithFrame:self.view.bounds
+    @try {
+        /* Deliberately no [super loadView]: the Settings host's implementation
+         * is private, and the pane must not depend on whether it installs a
+         * table, a nib or nothing at all. A bare container with flexible
+         * bounds is the whole hierarchy this pane needs.
+         *
+         * A host that created this controller with -init never went through
+         * initForContentSize:, so the stored size can still be zero; the
+         * container then only needs sane non-zero bounds to lay out. */
+        CGSize size = _contentSize;
+        if (size.width <= 0.0f || size.height <= 0.0f) {
+            size = CGSizeMake(320.0f, 480.0f);
+        }
+        UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0.0f, 0.0f,
+                                                                    size.width,
+                                                                    size.height)];
+        container.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                     UIViewAutoresizingFlexibleHeight;
+        container.backgroundColor = [UIColor groupTableViewBackgroundColor];
+        self.view = container;
+
+        [self ug_installTableView];
+        UGTrace(@"loadView: exit tableView=%d",
+                (int)(_tableView != nil));
+    } @catch (NSException *exception) {
+        /* A throw here is what a blank-then-killed pane looks like; keep the
+         * host alive with an empty view and record why. */
+        UGTrace(@"loadView: threw %@: %@", [exception name], [exception reason]);
+        if (![self isViewLoaded]) {
+            self.view = [[UIView alloc] initWithFrame:CGRectMake(0.0f, 0.0f,
+                                                                320.0f, 480.0f)];
+        }
+    }
+}
+
+/* The grouped table is installed here, never by the base class and never in
+ * viewDidLoad: both loadView and viewWillAppear: call it, so the table exists
+ * whichever of the two the host runs first (or if it releases the view). */
+- (void)ug_installTableView
+{
+    if (_tableView) return;
+
+    UIView *host = self.view;
+    if (!host) {
+        UGTrace(@"ug_installTableView: no container view");
+        return;
+    }
+
+    _tableView = [[UITableView alloc] initWithFrame:host.bounds
                                              style:UITableViewStyleGrouped];
     _tableView.autoresizingMask =
         UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _tableView.backgroundColor = [UIColor groupTableViewBackgroundColor];
     _tableView.dataSource = self;
     _tableView.delegate = self;
-    [self.view addSubview:_tableView];
+    [host addSubview:_tableView];
 
-    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
-    [center addObserver:self
-               selector:@selector(applicationWillResignActive:)
-                   name:UIApplicationWillResignActiveNotification
-                 object:nil];
-    [center addObserver:self
-               selector:@selector(applicationDidEnterBackground:)
-                   name:UIApplicationDidEnterBackgroundNotification
-                 object:nil];
+    UGTrace(@"ug_installTableView: installed %ld sections", (long)kUGSectionCount);
+}
+
+- (void)viewDidLoad
+{
+    UGTrace(@"viewDidLoad: entry tableView=%d", (int)(_tableView != nil));
+
+    /* The Settings host's base class does not publish viewDidLoad. Ask the
+     * superclass - not the receiver, which always answers yes - whether
+     * the implementation is there, so a host without it does not raise
+     * unrecognized-selector. In the app build the superclass is a plain
+     * UIViewController, which does implement it, so no private assumption is
+     * made either way. */
+    if ([[self superclass] instancesRespondToSelector:@selector(viewDidLoad)]) {
+        [super viewDidLoad];
+    }
+
+    [self ug_installTableView];
+
+    /* Registration is idempotent: a repeated viewDidLoad must not make every
+     * notification call the handler twice. */
+    if (!_notificationsInstalled) {
+        _notificationsInstalled = YES;
+
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        [center addObserver:self
+                   selector:@selector(applicationWillResignActive:)
+                       name:UIApplicationWillResignActiveNotification
+                     object:nil];
+        [center addObserver:self
+                   selector:@selector(applicationDidEnterBackground:)
+                       name:UIApplicationDidEnterBackgroundNotification
+                     object:nil];
+    }
+
+    UGTrace(@"viewDidLoad: exit tableView=%d", (int)(_tableView != nil));
 }
 
 - (void)viewWillAppear:(BOOL)animated
 {
+    UGTrace(@"viewWillAppear: entry tableView=%d ipc=%d",
+            (int)(_tableView != nil), (int)(_ipc != nil));
+
     [super viewWillAppear:animated];
     self.title = @"Usage Guard";
+
+    /* Defensive: a host that skipped loadView, or one that released the view,
+     * leaves no table to reload. Build it instead of messaging nil. */
+    [self ug_installTableView];
+    if (!_tableView) {
+        UGTrace(@"viewWillAppear: no table view, skipping refresh");
+        return;
+    }
+    if (!_ipc) {
+        UGTrace(@"viewWillAppear: no ipc, skipping refresh");
+        return;
+    }
 
     /* Force one rebuild: the table may have been laid out before the state was
      * read, and the window is not attached yet during viewWillAppear. */
@@ -215,20 +365,35 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     [self refreshFromDiskReloading:NO];
     [_tableView reloadData];
     [self startRefreshTimer];
+
+    UGTrace(@"viewWillAppear: exit refreshed");
 }
 
 - (void)viewDidAppear:(BOOL)animated
 {
+    UGTrace(@"viewDidAppear: entry setupComplete=%d hasPIN=%d tableView=%d",
+            (int)(_ipc ? [_ipc setupComplete] : 0),
+            (int)(_ipc ? [_ipc hasPIN] : 0),
+            (int)(_tableView != nil));
+
     [super viewDidAppear:animated];
 
     if (_wizardShown) return;
     _wizardShown = YES;
+
+    if (!_ipc) {
+        UGTrace(@"viewDidAppear: no ipc, skipping wizard check");
+        return;
+    }
 
     if (![_ipc setupComplete]) [self beginWizard];
 }
 
 - (void)viewWillDisappear:(BOOL)animated
 {
+    UGTrace(@"viewWillDisappear: entry tableView=%d alerts=%ld",
+            (int)(_tableView != nil), (long)_alertCount);
+
     [self stopRefreshTimer];
 
     /* Whatever was on screen is gone with the pane; start clean next time. */
@@ -237,6 +402,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     [self clearAuthorization];
 
     [super viewWillDisappear:animated];
+
+    UGTrace(@"viewWillDisappear: exit");
 }
 
 - (void)applicationWillResignActive:(NSNotification *)notification
@@ -255,6 +422,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)clearAuthorization
 {
+    UGTrace(@"clearAuthorization: entry activeAlert=%d wizardStep=%ld",
+            (int)(_activeAlert != nil), (long)_wizardStep);
+
     _authorized = NO;
     _pendingAuthorizedAction = nil;
     _pendingPIN = nil;
@@ -265,10 +435,16 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
      * resume block goes with it. */
     _resumeAfterNotice = nil;
 
+    /* Reading the weak ivar into a strong local keeps the alert alive for the
+     * whole dismissal; if it was already released this is simply nil. */
     UIAlertView *alert = _activeAlert;
     _activeAlert = nil;
-    if (!alert) return;
+    if (!alert) {
+        UGTrace(@"clearAuthorization: no live alert");
+        return;
+    }
 
+    UGTrace(@"clearAuthorization: dismissing alert tag=%ld", (long)alert.tag);
     [alert dismissWithClickedButtonIndex:alert.cancelButtonIndex animated:NO];
 
     /* A wizard step that was on screen is gone with the alert: the wizard is
@@ -485,6 +661,37 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     return version.length > 0 ? version : @UG_VERSION;
 }
 
+#pragma mark - Diagnostics
+
+/* Path and size in one row: the parent needs the path to copy the file off the
+ * device with 3uTools and the size to know whether anything was written. */
+- (NSString *)traceLogDescription
+{
+    NSString *path = UGTracePath();
+    if (path.length == 0) return @"cale indisponibilă";
+
+    unsigned long long bytes = UGTraceFileSize();
+    NSString *size = nil;
+    if (bytes == 0) {
+        size = @"absent sau gol";
+    } else if (bytes < 1024ULL) {
+        size = [NSString stringWithFormat:@"%llu B", bytes];
+    } else {
+        size = [NSString stringWithFormat:@"%.1f KB", (double)bytes / 1024.0];
+    }
+
+    return [NSString stringWithFormat:@"%@ · %@", path, size];
+}
+
+/* Deletes the trace file. Nothing is traced after the delete, because a trace
+ * line would immediately recreate the file the parent just removed. */
+- (void)deleteTraceLog
+{
+    UGTrace(@"deleteTraceLog: entry size=%llu", UGTraceFileSize());
+    UGTraceRemoveLog();
+    [_tableView reloadData];
+}
+
 #pragma mark - Table structure
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
@@ -523,7 +730,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 {
     (void)tableView;
     if (indexPath.section == kUGSectionInformation &&
-        indexPath.row == kUGInformationRowPreferencesPath) {
+        (indexPath.row == kUGInformationRowPreferencesPath ||
+         indexPath.row == kUGInformationRowTraceLog)) {
         return kUGPathRowHeight;
     }
     return kUGStandardRowHeight;
@@ -664,6 +872,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 {
     (void)tableView;
 
+    UGTrace(@"cellForRow: section=%ld row=%ld",
+            (long)indexPath.section, (long)indexPath.row);
+
     switch (indexPath.section) {
         case kUGSectionStatus:
             switch (indexPath.row) {
@@ -755,6 +966,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
                 case kUGInformationRowPreferencesPath:
                     return [self pathCellWithTitle:@"Fișier preferințe"
                                             detail:[_ipc preferencesPath]];
+                case kUGInformationRowTraceLog:
+                    return [self pathCellWithTitle:@"Jurnal"
+                                            detail:[self traceLogDescription]];
                 case kUGInformationRowStatusAge:
                     return [self valueCellWithTitle:@"Stare runtime"
                                              detail:[self statusAgeDescription]];
@@ -764,6 +978,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
                 case kUGInformationRowDebugLogging:
                     return [self valueCellWithTitle:@"Jurnalizare (DebugLogging)"
                                              detail:[self debugLoggingDescription]];
+                case kUGInformationRowClearTraceLog:
+                    return [self buttonCellWithTitle:@"Șterge jurnalul"];
                 default:
                     break;
             }
@@ -781,9 +997,15 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
+    UGTrace(@"didSelectRow: section=%ld row=%ld",
+            (long)indexPath.section, (long)indexPath.row);
+
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-    if (_alertCount > 0) return;
+    if (_alertCount > 0) {
+        UGTrace(@"didSelectRow: ignored, %ld alert(s) live", (long)_alertCount);
+        return;
+    }
 
     switch (indexPath.section) {
         case kUGSectionLimits:
@@ -799,6 +1021,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
             if (indexPath.row == kUGSecurityRowPIN) [self beginChangingPIN];
             break;
 
+        case kUGSectionInformation:
+            if (indexPath.row == kUGInformationRowClearTraceLog) [self deleteTraceLog];
+            break;
+
         default:
             break;
     }
@@ -809,6 +1035,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (BOOL)applyChange:(void (^)(UGState *state))change
 {
     if (![_ipc applyStateChange:change]) {
+        UGTrace(@"applyChange: state write failed");
         [self showNotice:@"Setările nu au putut fi salvate. Verifică spațiul liber pe dispozitiv."
                    title:@"Eroare"];
         return NO;
@@ -820,6 +1047,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)setEnabled:(BOOL)enabled
 {
+    UGTrace(@"setEnabled: %d", (int)enabled);
+
     [self applyChange:^(UGState *state) {
         ug_set_enabled(state, enabled ? 1 : 0, UGNowSeconds());
     }];
@@ -827,12 +1056,16 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)setRequirePIN:(BOOL)required
 {
+    UGTrace(@"setRequirePIN: %d", (int)required);
+
     [_ipc setRequirePIN:required];
     [self refreshFromDiskReloading:YES];
 }
 
 - (void)enabledSwitchChanged:(UISwitch *)sender
 {
+    UGTrace(@"enabledSwitchChanged: on=%d", (int)sender.isOn);
+
     BOOL desired = sender.isOn;
 
     if (!desired && [self authorizationRequired]) {
@@ -848,6 +1081,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)requirePINSwitchChanged:(UISwitch *)sender
 {
+    UGTrace(@"requirePINSwitchChanged: on=%d", (int)sender.isOn);
+
     BOOL desired = sender.isOn;
 
     if (!desired && [self authorizationRequired]) {
@@ -861,6 +1096,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)performActionAtIndex:(NSInteger)row
 {
+    UGTrace(@"performActionAtIndex: row=%ld", (long)row);
+
     switch (row) {
         case kUGActionRowStartBreak: {
             [self requireAuthorizationThen:^{
@@ -925,6 +1162,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)requireAuthorizationThen:(void (^)(void))action
 {
+    UGTrace(@"requireAuthorizationThen: needed=%d lockout=%ld",
+            (int)[self authorizationRequired], (long)[_ipc lockoutRemaining]);
+
     if (![self authorizationRequired]) {
         if (action) action();
         return;
@@ -953,6 +1193,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleAuthorizationAlert:(UIAlertView *)alertView cancelled:(BOOL)cancelled
 {
+    UGTrace(@"handleAuthorizationAlert: cancelled=%d", (int)cancelled);
+
     if (cancelled) {
         _pendingAuthorizedAction = nil;
         return;
@@ -991,16 +1233,22 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)beginEditingUsageMinutes
 {
+    UGTrace(@"beginEditingUsageMinutes");
+
     [self requireAuthorizationThen:^{ [self presentUsageEditor]; }];
 }
 
 - (void)beginEditingBreakMinutes
 {
+    UGTrace(@"beginEditingBreakMinutes");
+
     [self requireAuthorizationThen:^{ [self presentBreakEditor]; }];
 }
 
 - (void)presentUsageEditor
 {
+    UGTrace(@"presentUsageEditor");
+
     UIAlertView *alert = [[UIAlertView alloc] initWithTitle:@"Utilizare (minute)"
                                                    message:@"Între 1 și 240 de minute."
                                                   delegate:self
@@ -1018,6 +1266,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)presentBreakEditor
 {
+    UGTrace(@"presentBreakEditor");
+
     UIAlertView *alert = [[UIAlertView alloc] initWithTitle:@"Pauză (minute)"
                                                    message:@"Între 1 și 240 de minute."
                                                   delegate:self
@@ -1035,6 +1285,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleLimitAlert:(UIAlertView *)alertView usage:(BOOL)usage
 {
+    UGTrace(@"handleLimitAlert: usage=%d", (int)usage);
+
     /* The alert can outlive the authorization that opened it; a cleared PIN
      * state must not let it write. */
     if ([self authorizationRequired]) return;
@@ -1060,11 +1312,15 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)beginChangingPIN
 {
+    UGTrace(@"beginChangingPIN");
+
     [self requireAuthorizationThen:^{ [self presentNewPINEditor]; }];
 }
 
 - (void)presentNewPINEditor
 {
+    UGTrace(@"presentNewPINEditor");
+
     UIAlertView *alert = [[UIAlertView alloc]
                           initWithTitle:([_ipc hasPIN] ? @"Schimbă codul PIN"
                                                         : @"Setează un cod PIN")
@@ -1079,6 +1335,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)presentConfirmPINEditor
 {
+    UGTrace(@"presentConfirmPINEditor");
+
     UIAlertView *alert = [[UIAlertView alloc] initWithTitle:@"Confirmă codul PIN"
                                                    message:@"Introdu din nou codul."
                                                   delegate:self
@@ -1091,6 +1349,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleNewPINAlert:(UIAlertView *)alertView
 {
+    UGTrace(@"handleNewPINAlert");
+
     if ([self authorizationRequired]) return;
 
     NSString *pin = [[alertView textFieldAtIndex:0] text];
@@ -1107,6 +1367,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleConfirmPINAlert:(UIAlertView *)alertView
 {
+    UGTrace(@"handleConfirmPINAlert");
+
     if ([self authorizationRequired]) return;
 
     NSString *pin = [[alertView textFieldAtIndex:0] text];
@@ -1134,6 +1396,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)beginWizard
 {
+    UGTrace(@"beginWizard: alerts=%ld", (long)_alertCount);
+
     if (_alertCount > 0) return;
 
     _wizardStep = kUGWizardStepWelcome;
@@ -1147,6 +1411,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)abortWizard
 {
+    UGTrace(@"abortWizard: step=%ld", (long)_wizardStep);
+
     /* Cancel at any step leaves the guard exactly as it was: nothing enforced,
      * nothing written. */
     _wizardStep = kUGWizardStepIdle;
@@ -1157,6 +1423,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)presentWizardStep
 {
+    UGTrace(@"presentWizardStep: step=%ld", (long)_wizardStep);
+
     UIAlertView *alert = nil;
 
     switch (_wizardStep) {
@@ -1251,6 +1519,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)handleWizardAlert:(UIAlertView *)alertView
 {
+    UGTrace(@"handleWizardAlert: tag=%ld step=%ld",
+            (long)alertView.tag, (long)_wizardStep);
+
     /* The wizard was torn down (cancel or an authorization clear): a late
      * dismissal must not continue it. */
     if (_wizardStep == kUGWizardStepIdle) return;
@@ -1330,6 +1601,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)finishWizard
 {
+    UGTrace(@"finishWizard: step=%ld", (long)_wizardStep);
+
     /* The finish alert can outlive the authorization that opened the wizard. */
     if ([self authorizationRequired]) {
         [self abortWizard];
@@ -1373,6 +1646,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)presentAlert:(UIAlertView *)alert
 {
+    UGTrace(@"presentAlert: tag=%ld alerts=%ld", (long)alert.tag, (long)_alertCount);
+
     alert.delegate = self;
     _activeAlert = alert;
     _alertCount++;
@@ -1399,6 +1674,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)alertViewCancel:(UIAlertView *)alertView
 {
+    UGTrace(@"alertViewCancel: tag=%ld alerts=%ld",
+            (long)alertView.tag, (long)_alertCount);
+
     /* iOS 6 dismisses an alert this way when the app leaves the foreground and
      * may skip didDismiss. Both paths decrement, and the count is clamped, so
      * the refresh loop can never be wedged by a lost dismissal. */
@@ -1410,6 +1688,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)alertView:(UIAlertView *)alertView didDismissWithButtonIndex:(NSInteger)buttonIndex
 {
+    UGTrace(@"didDismiss alert tag=%ld button=%ld alerts=%ld",
+            (long)alertView.tag, (long)buttonIndex, (long)_alertCount);
+
     if (_alertCount > 0) _alertCount--;
     if (alertView == _activeAlert) _activeAlert = nil;
 

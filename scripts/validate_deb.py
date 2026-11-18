@@ -12,14 +12,18 @@ control ``Package`` field, never by what the payload happens to contain:
       ``Library/MobileSubstrate/DynamicLibraries/``: ``<name>.dylib`` and
       ``<name>.plist`` with matching ``<name>``; nothing else
 
-  tweak + preference bundle layout (``Package: org.usageguard.timer``)
-    * exactly the five files in ``MAIN_PAYLOAD_FILES``:
+  tweak + preference bundle + app layout (``Package: org.usageguard.timer``)
+    * exactly the seven files in ``MAIN_PAYLOAD_FILES``:
+          Applications/UsageGuard.app/UsageGuard
+          Applications/UsageGuard.app/Info.plist
           Library/MobileSubstrate/DynamicLibraries/UsageGuard.dylib
           Library/MobileSubstrate/DynamicLibraries/UsageGuard.plist
           Library/PreferenceBundles/UsageGuardPrefs.bundle/UsageGuardPrefs
           Library/PreferenceBundles/UsageGuardPrefs.bundle/Info.plist
           Library/PreferenceLoader/Preferences/UsageGuard.plist
-    * ``Depends`` also lists ``preferenceloader``
+    * ``Depends`` also lists ``preferenceloader`` and ``uikittools`` (the
+      maintainer script needs ``uicache``)
+    * ``control.tar`` carries ``postinst``, executable, refreshing the icon cache
 
 What it enforces, on a single .deb:
 
@@ -31,8 +35,12 @@ What it enforces, on a single .deb:
     * ``Architecture: iphoneos-arm``
     * ``Package`` and ``Version`` present and non-empty
     * ``Depends`` lists ``mobilesubstrate`` (optionally with a version clause)
-    * ``Depends`` lists ``preferenceloader`` (tweak + preference bundle layout
-      only; the probe's two-file layout depends on ``mobilesubstrate`` alone)
+    * ``Depends`` lists ``preferenceloader`` and ``uikittools`` (tweak +
+      preference bundle + app layout only; the probe's two-file layout depends
+      on ``mobilesubstrate`` alone)
+    * ``postinst`` present, with all of the 0755 permission bits set
+      (``mode & 0755 == 0755``; 0750 or 0700 fails) and referencing ``uicache``
+      (tweak + preference bundle + app layout only)
 
   payload layout
     * every path is relative, normalised, free of ``..``, ``/home/``, ``/dev/``,
@@ -63,7 +71,20 @@ What it enforces, on a single .deb:
     * LC_VERSION_MIN_IPHONEOS present with min OS 6.0.0
     * LC_CODE_SIGNATURE present
 
-  PreferenceLoader entry (tweak + preference bundle layout only)
+  Mach-O (the configuration app binary, tweak + preference bundle + app layout)
+    * thin little-endian 32-bit Mach-O, filetype MH_EXECUTE (2) only: a tweak
+      dylib or a bundle in ``/Applications/UsageGuard.app`` would never launch
+    * cputype == 12 (CPU_TYPE_ARM), cpusubtype == 9 (CPU_SUBTYPE_ARM_V7)
+    * LC_VERSION_MIN_IPHONEOS present with min OS 6.0.0
+    * LC_CODE_SIGNATURE present
+
+  app Info.plist (tweak + preference bundle + app layout only)
+    * parses as a property list
+    * ``CFBundleIdentifier`` == ``org.usageguard.timer.app``
+    * ``CFBundleExecutable`` == ``UsageGuard``
+    * ``CFBundleShortVersionString`` equals the control ``Version``
+
+  PreferenceLoader entry (tweak + preference bundle + app layout only)
     * parses as a property list
     * top-level ``entry`` dict names ``bundle`` == ``UsageGuardPrefs``
     * ``entry.isController`` is boolean true and ``entry.detail`` is a
@@ -71,8 +92,9 @@ What it enforces, on a single .deb:
     * the bundle's ``Info.plist`` sets ``CFBundleExecutable`` ==
       ``UsageGuardPrefs`` and a non-empty ``NSPrincipalClass`` (independent
       keys: they are allowed to differ)
-    * ``Library/PreferenceLoader`` and ``Library/PreferenceBundles`` may not
-      appear at all -- not even as empty directories -- in the probe layout
+    * ``Library/PreferenceLoader``, ``Library/PreferenceBundles`` and
+      ``Applications`` may not appear at all -- not even as empty directories --
+      in the probe layout
 
 Exit status is 0 only when every applicable check passes. Failures print the
 check name plus the observed value, so a red CI run is diagnosable from the log.
@@ -128,18 +150,37 @@ MIN_OS_REQUIRED = (6, 0, 0)
 # Package ids decide which payload layout is required (see the module docstring).
 MAIN_PACKAGE = "org.usageguard.timer"
 
-# The tweak + preference bundle layout. The self-test mirrors these paths.
+# The tweak + preference bundle + app layout. The self-test mirrors these paths.
 MAIN_DYLIB = "UsageGuard"
 PREFERENCE_BUNDLE = "UsageGuardPrefs"
 PREFERENCE_LOADER_DIR = "Library/PreferenceLoader"
 PREFERENCES_DIR = PREFERENCE_LOADER_DIR + "/Preferences"
 BUNDLE_PARENT_DIR = "Library/PreferenceBundles"
 BUNDLE_DIR = "%s/%s.bundle" % (BUNDLE_PARENT_DIR, PREFERENCE_BUNDLE)
-# PreferenceLoader/Bundles packaging belongs to the Settings package only; the
-# probe must not ship (or even create) these directories.
-PREFERENCE_PREFIXES = (PREFERENCE_LOADER_DIR, BUNDLE_PARENT_DIR)
+# The configuration app. It is a rootful /Applications bundle, so it is not
+# sandboxed like an App Store IPA and can read the tweak's preferences file.
+APP_DIR = "Applications"
+APP_BUNDLE = "UsageGuard.app"
+APP_BUNDLE_DIR = "%s/%s" % (APP_DIR, APP_BUNDLE)
+APP_EXECUTABLE = "UsageGuard"
+APP_BINARY = "%s/%s" % (APP_BUNDLE_DIR, APP_EXECUTABLE)
+APP_INFO_PLIST = "%s/Info.plist" % APP_BUNDLE_DIR
+APP_BUNDLE_ID = "org.usageguard.timer.app"
+MAIN_POSTINST = "postinst"
+MAIN_POSTINST_MODE = 0o755
+ICON_CACHE_TOOL = "uicache"
+
+# PreferenceLoader/PreferenceBundles/Applications packaging belongs to the main
+# package only; the probe must not ship (or even create) these directories.
+MAIN_ONLY_PREFIXES = (
+    (PREFERENCE_LOADER_DIR, "PreferenceLoader"),
+    (BUNDLE_PARENT_DIR, "PreferenceBundles"),
+    (APP_DIR, "/Applications app"),
+)
 
 MAIN_PAYLOAD_FILES = (
+    APP_BINARY,
+    APP_INFO_PLIST,
     "%s/%s.dylib" % (DYLIB_DIR, MAIN_DYLIB),
     "%s/%s.plist" % (DYLIB_DIR, MAIN_DYLIB),
     "%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE),
@@ -468,9 +509,17 @@ def wants_preference_layout(fields):
     layout by shipping a two-file payload. The probe keeps the two-file
     layout, and so does any unknown package id, which is why the probe (run with
     ``--expect-package org.usageguard.probe``) is never asked for
-    ``preferenceloader``.
+    ``preferenceloader`` or ``uikittools``.
     """
     return fields.get("package", "") == MAIN_PACKAGE
+
+
+def main_only_label(normalised):
+    """Return the packaging label when this path belongs to the main package only."""
+    for prefix, label in MAIN_ONLY_PREFIXES:
+        if normalised == prefix or normalised.startswith(prefix + "/"):
+            return label
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -577,6 +626,92 @@ def validate_preference_bundle(report, payload_files):
                  not info_problems, "; ".join(info_problems) or info_detail)
 
 
+def validate_configuration_app(report, payload_files, fields):
+    """Check the /Applications app: an armv7 MH_EXECUTE and its Info.plist."""
+    binary = payload_files.get(APP_BINARY)
+    if binary is None:
+        for name in ("app binary is armv7 MH_EXECUTE",
+                     "app binary min OS 6.0.0",
+                     "app binary signed"):
+            report.fail(name, "%s is missing from the payload" % APP_BINARY)
+    else:
+        # MH_EXECUTE only: a dylib or bundle in /Applications/UsageGuard.app
+        # would be installed but never launched by SpringBoard.
+        info, errors = parse_macho(binary, expected_filetype=MH_EXECUTE)
+        unsigned = [e for e in errors if "LC_CODE_SIGNATURE" in e]
+        arch_errors = architecture_errors(errors)
+        report.check("app binary is armv7 MH_EXECUTE", not arch_errors,
+                     "; ".join(arch_errors) if arch_errors
+                     else "filetype=%s (%s), cputype=%s subtype=%s%s"
+                     % (info.get("filetype", "?"),
+                        filetype_label(info.get("filetype", -1)),
+                        info.get("cputype", "?"), info.get("cpusubtype", "?"),
+                        ", single-slice fat" if info.get("fat") else ""))
+        report.check("app binary min OS 6.0.0",
+                     "min_os" in info and info["min_os"] == MIN_OS_REQUIRED,
+                     "%d.%d.%d" % info["min_os"] if "min_os" in info else "missing")
+        report.check("app binary signed", not unsigned,
+                     "unsigned" if unsigned else "signed")
+
+    # The app's identity is what makes it a second host for the same
+    # preferences file: the bundle id is stable, the executable names the binary
+    # inside the bundle, and the version must track the package version (the app,
+    # the pane and the tweak are one release).
+    expected_version = fields.get("version", "")
+    problems = []
+    detail = ""
+    payload = payload_files.get(APP_INFO_PLIST)
+    if payload is None:
+        problems.append("%s is missing from the payload" % APP_INFO_PLIST)
+    else:
+        try:
+            parsed = plistlib.loads(payload)
+        except Exception as error:  # plistlib raises several unrelated types
+            problems.append("not a valid property list: %s" % error)
+        else:
+            if not isinstance(parsed, dict):
+                problems.append("top-level dict missing")
+                parsed = {}
+            identifier = parsed.get("CFBundleIdentifier")
+            executable = parsed.get("CFBundleExecutable")
+            version = parsed.get("CFBundleShortVersionString")
+            if identifier != APP_BUNDLE_ID:
+                problems.append("CFBundleIdentifier is %r, expected %r"
+                                % (identifier, APP_BUNDLE_ID))
+            if executable != APP_EXECUTABLE:
+                problems.append("CFBundleExecutable is %r, expected %r"
+                                % (executable, APP_EXECUTABLE))
+            if version != expected_version:
+                problems.append("CFBundleShortVersionString is %r, expected %r (control Version)"
+                                % (version, expected_version))
+            else:
+                detail = "%s %s" % (identifier, version)
+    report.check("app Info.plist matches control identity and version",
+                 not problems, "; ".join(problems) or detail)
+
+
+def validate_maintainer_scripts(report, member, payload):
+    """Check the control.tar postinst: present, executable and runs uicache."""
+    if member is None or payload is None:
+        for name in ("postinst present", "postinst is executable",
+                     "postinst refreshes the icon cache"):
+            report.fail(name, "%s is missing from control.tar" % MAIN_POSTINST)
+        return
+
+    report.check("postinst present", True, "%s (%d bytes)" % (MAIN_POSTINST, len(payload)))
+    mode = member.mode & 0o777
+    executable = (mode & MAIN_POSTINST_MODE) == MAIN_POSTINST_MODE
+    report.check("postinst is executable", executable,
+                 "mode %04o" % mode if executable
+                 else "mode %04o, expected at least %04o" % (mode, MAIN_POSTINST_MODE))
+    # iOS 6 only registers an /Applications bundle after uicache (or a reboot),
+    # so a postinst that never calls it ships an app with no home-screen icon.
+    refreshes = ICON_CACHE_TOOL.encode() in payload
+    report.check("postinst refreshes the icon cache", refreshes,
+                 "%s invoked" % ICON_CACHE_TOOL if refreshes
+                 else "%s is not referenced" % ICON_CACHE_TOOL)
+
+
 def validate(deb_path, args):
     report = Report(deb_path)
     try:
@@ -624,10 +759,16 @@ def validate(deb_path, args):
         return report
 
     control_blob = None
+    postinst_member = None
+    postinst_blob = None
     for path, member, payload in control_entries:
         normalised, error = normalise_path(path)
-        if error is None and normalised == "control" and member.isfile():
+        if error is not None:
+            continue
+        if normalised == "control" and member.isfile():
             control_blob = payload
+        elif normalised == MAIN_POSTINST and member.isfile():
+            postinst_member, postinst_blob = member, payload
     if control_blob is None:
         report.fail("control file present", "no ./control entry in control.tar")
         report.print_table()
@@ -647,6 +788,10 @@ def validate(deb_path, args):
     if preference_layout:
         report.check("control: Depends preferenceloader", depends_contains(depends, "preferenceloader"),
                      depends or "<missing>")
+        # uicache ships in uikittools; the postinst below calls it.
+        report.check("control: Depends uikittools", depends_contains(depends, "uikittools"),
+                     depends or "<missing>")
+        validate_maintainer_scripts(report, postinst_member, postinst_blob)
 
     if args.expect_package:
         package = fields.get("package", "")
@@ -671,37 +816,28 @@ def validate(deb_path, args):
     problems = []
     allowed_dirs = {"", "Library", "Library/MobileSubstrate", DYLIB_DIR}
     if preference_layout:
+        # The app lives in /Applications, which iOS 6 does not sandbox the way
+        # an App Store bundle is sandboxed; it is part of this package only.
         allowed_dirs |= {PREFERENCE_LOADER_DIR, PREFERENCES_DIR,
-                         BUNDLE_PARENT_DIR, BUNDLE_DIR}
+                         BUNDLE_PARENT_DIR, BUNDLE_DIR, APP_DIR, APP_BUNDLE_DIR}
 
     for path, member, payload in data_entries:
-        if member.isdir():
-            # dpkg/tar emit an archive-root entry ("./"); only the directories
-            # leading to the MobileSubstrate payload are acceptable.
-            if path.rstrip("/") in (".", ""):
-                continue
-            normalised, error = normalise_path(path)
-            if error is not None:
-                problems.append("%s: %s" % (path, error))
-                continue
-            if not preference_layout and any(
-                    normalised == prefix or normalised.startswith(prefix + "/")
-                    for prefix in PREFERENCE_PREFIXES):
-                problems.append("%s: PreferenceLoader/PreferenceBundles directories are only "
-                                "allowed in package %s" % (normalised, MAIN_PACKAGE))
-                continue
-            if normalised not in allowed_dirs:
-                problems.append("%s: unexpected directory in payload" % normalised)
+        # dpkg/tar emit an archive-root entry ("./").
+        if path.rstrip("/") in (".", ""):
             continue
         normalised, error = normalise_path(path)
         if error is not None:
             problems.append("%s: %s" % (path, error))
             continue
-        if not preference_layout and any(
-                normalised == prefix or normalised.startswith(prefix + "/")
-                for prefix in PREFERENCE_PREFIXES):
-            problems.append("%s: PreferenceLoader/PreferenceBundles payload is only allowed "
-                            "in package %s" % (normalised, MAIN_PACKAGE))
+        if not preference_layout:
+            label = main_only_label(normalised)
+            if label is not None:
+                problems.append("%s: %s packaging is only allowed in package %s"
+                                % (normalised, label, MAIN_PACKAGE))
+                continue
+        if member.isdir():
+            if normalised not in allowed_dirs:
+                problems.append("%s: unexpected directory in payload" % normalised)
             continue
         if not member.isfile():
             problems.append("%s: not a regular file (symlink/hardlink/device rejected)" % normalised)
@@ -796,6 +932,7 @@ def validate(deb_path, args):
                  "ok" if not macho_errors else "; ".join(macho_errors))
 
     if preference_layout:
+        validate_configuration_app(report, payload_files, fields)
         validate_preference_bundle(report, payload_files)
 
     report.print_table()

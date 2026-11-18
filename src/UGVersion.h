@@ -8,7 +8,7 @@
 #ifndef UG_VERSION_H
 #define UG_VERSION_H
 
-#define UG_VERSION "1.0.3"
+#define UG_VERSION "1.0.4"
 
 /* Persisted cycle state, PIN vault and settings, written by the tweak/pane. */
 #define UG_PREFS_PATH "/var/mobile/Library/Preferences/org.usageguard.timelock.plist"
@@ -18,5 +18,9 @@
 
 /* Operator kill switch: while this file exists the runtime does nothing. */
 #define UG_KILLSWITCH_PATH "/var/mobile/Library/Preferences/org.usageguard.timer.disable"
+
+/* Local diagnostics trace written by the Preferences bundle (UGTrace); never
+ * read by the runtime and never uploaded anywhere. */
+#define UG_TRACE_PATH "/var/mobile/Library/Preferences/org.usageguard.timer.trace.log"
 
 #endif /* UG_VERSION_H */
