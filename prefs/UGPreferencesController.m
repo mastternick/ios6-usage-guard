@@ -271,8 +271,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
     [alert dismissWithClickedButtonIndex:alert.cancelButtonIndex animated:NO];
 
-    /* A wizard step that was on screen is gone with the alert: start the
-     * wizard over instead of resuming a half-finished step. */
+    /* A wizard step that was on screen is gone with the alert: the wizard is
+     * abandoned exactly as on cancel (it is not re-offered, because
+     * _wizardShown stays YES) instead of resuming a half-finished step. */
     if (_wizardStep != kUGWizardStepIdle) _wizardStep = kUGWizardStepIdle;
 }
 
