@@ -750,21 +750,23 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (void)performActionAtIndex:(NSInteger)row
 {
     switch (row) {
-        case kUGActionRowStartBreak:
+        case kUGActionRowStartBreak: {
             [self requireAuthorizationThen:^{
                 [self applyChange:^(UGState *state) {
                     ug_start_break(state, UGNowSeconds());
                 }];
             }];
             break;
+        }
 
-        case kUGActionRowReset:
+        case kUGActionRowReset: {
             [self requireAuthorizationThen:^{
                 [self applyChange:^(UGState *state) {
                     ug_reset(state, UGNowSeconds());
                 }];
             }];
             break;
+        }
 
         case kUGActionRowPause15:
         case kUGActionRowPause30:
@@ -779,21 +781,24 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
             break;
         }
 
-        case kUGActionRowResume:
+        case kUGActionRowResume: {
             [self requireAuthorizationThen:^{
                 [self applyChange:^(UGState *state) {
                     ug_resume(state, UGNowSeconds());
                 }];
             }];
             break;
+        }
 
-        case kUGActionRowTestOverlay:
+        case kUGActionRowTestOverlay: {
             /* Visual check only: no state, so no PIN and no persistence. */
             [_ipc postTestOverlay];
             break;
+        }
 
-        default:
+        default: {
             break;
+        }
     }
 }
 
