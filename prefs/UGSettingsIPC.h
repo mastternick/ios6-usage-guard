@@ -8,10 +8,10 @@
  * hands mutations back as a block, so persistence rules (read, modify, write,
  * announce) live in exactly one place.
  *
- * Both files belong to the tweak:
- *   org.usageguard.timelock.plist  cycle state, PIN vault, SetupComplete,
- *                                  RequirePIN (written by us, read by SpringBoard)
- *   org.usageguard.timer.status.plist  runtime snapshot (written by SpringBoard)
+ * Both files belong to the tweak; their locations come from UGVersion.h:
+ *   UG_PREFS_PATH   cycle state, PIN vault, SetupComplete,
+ *                   RequirePIN (written by us, read by SpringBoard)
+ *   UG_STATUS_PATH  runtime snapshot (written by SpringBoard)
  */
 
 @interface UGSettingsIPC : NSObject

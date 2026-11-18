@@ -252,7 +252,8 @@ prefs/UGSettingsIPC.{h,m}            plist access and Darwin announcements
 src/UGGuardCore.{h,c}   pure C cycle engine, serialization, MM:SS formatting
 src/UGPrefs.{h,m}       plist persistence + PBKDF2 PIN vault and rate limit
 src/UGNotify.h          the three Darwin notification names
-src/UGVersion.h         release string and the status-file path
+src/UGVersion.h         release string plus the preferences, status and kill-switch paths
+                        (the only definition of all four; CI rejects copies)
 src/UGOverlayWindow.{h,m}  high-level window and break overlay UI
 src/UGParentPanel.{h,m}    PIN gate, first-run wizard, settings panel
 src/UGRuntime.{h,m}     clock, Darwin notifications, guarded swizzles, glue
@@ -276,7 +277,7 @@ bundle, statically validates both packages, and uploads:
 
 | artifact | contents |
 | --- | --- |
-| `usage-guard-deb` | `org.usageguard.timer_1.0.2_iphoneos-arm.deb` — install this |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.3_iphoneos-arm.deb` — install this |
 | `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
 | `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
 
@@ -290,17 +291,22 @@ gh run download --name usage-guard-deb
 Validation is enforced, not advisory: before building, the pipeline fails unless
 `control`, the bundle's `Info.plist` (`prefs/Resources/Info.plist`, the file
 Theos stages into the bundle) and `src/UGVersion.h` all carry the same version,
-and unless the pane takes that version from the header — a hard-coded `1.0.2`
+and unless the pane takes that version from the header — a hard-coded `1.0.3`
 literal in `prefs/UGPreferencesController.m` or `prefs/UGSettingsIPC.m` fails
-the build.
+the build. The same step also fails if
+`org.usageguard.timelock.plist`, `org.usageguard.timer.status.plist` or
+`org.usageguard.timer.disable` appears anywhere under `src/` or `prefs/`
+outside `src/UGVersion.h`, so the release version and those plist paths have
+exactly one definition.
 The validator then fails the package unless
 
 * the payload is exactly five files — the armv7 `MH_DYLIB` and its filter plist
-  under `Library/MobileSubstrate/DynamicLibraries/`, the armv7 bundle executable
-  (`UsageGuardPrefs`; Theos links it with `-dynamiclib`, so it is accepted as
-  either `MH_DYLIB` or `MH_BUNDLE`) and its `Info.plist` under
+  under `Library/MobileSubstrate/DynamicLibraries/`, the armv7 `MH_BUNDLE`
+  executable (`UsageGuardPrefs`) and its `Info.plist` under
   `Library/PreferenceBundles/UsageGuardPrefs.bundle/`, and the PreferenceLoader
-  entry `Library/PreferenceLoader/Preferences/UsageGuard.plist`;
+  entry `Library/PreferenceLoader/Preferences/UsageGuard.plist` (the validator
+  also accepts `MH_DYLIB` for the bundle executable, since Theos links a bundle
+  with `-dynamiclib` depending on the instance flags);
 * the filter plist names `com.apple.springboard` and the PreferenceLoader plist
   names the `UsageGuardPrefs` bundle;
 * the PreferenceLoader entry is a real controller — `entry.isController` is
@@ -328,7 +334,7 @@ make package FINALPACKAGE=1
 ```
 
 The package is written to `packages/` as
-`org.usageguard.timer_1.0.2_iphoneos-arm.deb`. The tweak targets
+`org.usageguard.timer_1.0.3_iphoneos-arm.deb`. The tweak targets
 `iphone:clang:6.1:6.0`, `ARCHS = armv7` (iPhone 4S / iPad 2 class hardware).
 
 ### Host tests (no Theos, no device)
@@ -354,9 +360,9 @@ Copy the built `.deb` to the device and install it with dpkg, then respring or
 restart SpringBoard:
 
 ```sh
-scp packages/org.usageguard.timer_1.0.2_iphoneos-arm.deb root@DEVICE_IP:/var/root/
+scp packages/org.usageguard.timer_1.0.3_iphoneos-arm.deb root@DEVICE_IP:/var/root/
 ssh root@DEVICE_IP \
-  'dpkg -i /var/root/org.usageguard.timer_1.0.2_iphoneos-arm.deb && killall -9 SpringBoard'
+  'dpkg -i /var/root/org.usageguard.timer_1.0.3_iphoneos-arm.deb && killall -9 SpringBoard'
 ```
 
 A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'

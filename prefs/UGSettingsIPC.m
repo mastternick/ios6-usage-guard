@@ -4,14 +4,10 @@
 
 #import "UGNotify.h"
 #import "UGPrefs.h"
+#import "UGVersion.h"
 
 /* A status file older than this is a leftover from a dead SpringBoard. */
 static const long long kUGStatusFreshnessSeconds = 5;
-
-static NSString *const kUGPreferencesPath =
-    @"/var/mobile/Library/Preferences/org.usageguard.timelock.plist";
-static NSString *const kUGStatusPath =
-    @"/var/mobile/Library/Preferences/org.usageguard.timer.status.plist";
 
 static NSNumber *UGNumberIn(NSDictionary *dictionary, NSString *key)
 {
@@ -138,12 +134,12 @@ static NSNumber *UGNumberIn(NSDictionary *dictionary, NSString *key)
 
 - (NSString *)preferencesPath
 {
-    return kUGPreferencesPath;
+    return @UG_PREFS_PATH;
 }
 
 - (NSString *)statusPath
 {
-    return kUGStatusPath;
+    return @UG_STATUS_PATH;
 }
 
 @end

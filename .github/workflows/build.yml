@@ -70,7 +70,7 @@ jobs:
       - name: Verify version consistency
         run: |
           set -euo pipefail
-          want="1.0.2"
+          want="1.0.3"
           fail=0
 
           report() {  # $1 file, $2 extracted value, $3 label
@@ -144,8 +144,27 @@ jobs:
             fail=1
           fi
 
+          # The preferences plist, the status plist and the kill-switch marker
+          # are defined once, in src/UGVersion.h. A second literal under src/
+          # or prefs/ is how the pane and the runtime drift apart without any
+          # build or test noticing.
+          for defined_path in \
+            org.usageguard.timelock.plist \
+            org.usageguard.timer.status.plist \
+            org.usageguard.timer.disable; do
+            offenders="$({ grep -rnF "$defined_path" src prefs || :; } \
+              | grep -vF 'src/UGVersion.h:' || :)"
+            if [ -n "$offenders" ]; then
+              echo "::error::$defined_path must be defined only in src/UGVersion.h; these files carry their own copy:"
+              printf '%s\n' "$offenders"
+              fail=1
+            else
+              echo "ok   $defined_path is defined only in src/UGVersion.h"
+            fi
+          done
+
           if [ "$fail" -ne 0 ]; then
-            echo "::error::version metadata is inconsistent; every file above must read $want"
+            echo "::error::metadata is inconsistent; fix the version strings and duplicated paths reported above (every version file must read $want)"
             exit 1
           fi
 
@@ -577,9 +596,11 @@ jobs:
               "Library/PreferenceLoader/Preferences/UsageGuard.plist",
               "```",
               "",
-              "The dylib is an armv7 `MH_DYLIB`, the preference bundle binary an armv7",
-              "`MH_BUNDLE`; both are signed. Because of the bundle the package depends on",
-              "`preferenceloader`. `%s` stays a dependency-free two-file package" % probe_name,
+              "The dylib is an armv7 `MH_DYLIB`; the preference bundle executable an",
+              "armv7 `MH_BUNDLE`. Both are signed. The validator accepts either filetype",
+              "for the bundle executable, because Theos may link a bundle with `-dynamiclib`",
+              "depending on the instance flags. Because of the bundle the package depends",
+              "on `preferenceloader`. `%s` stays a dependency-free two-file package" % probe_name,
               "(dylib plus filter plist).",
               "",
               "<details><summary>Usage Guard — %s</summary>" % main_name,

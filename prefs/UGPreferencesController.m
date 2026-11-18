@@ -94,7 +94,7 @@ enum {
 static NSString *const kUGEmergencyInstructions =
     @"Păstrează această procedură pentru situații de urgență.\n\n"
      "Prin SSH, ca root:\n"
-     "touch /var/mobile/Library/Preferences/org.usageguard.timer.disable\n\n"
+     "touch " UG_KILLSWITCH_PATH "\n\n"
      "Cât timp fișierul există, Usage Guard nu face nimic: fără ecran de "
      "blocare, fără numărătoare. După ce îl ștergi, repornește SpringBoard.";
 

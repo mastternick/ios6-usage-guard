@@ -1,14 +1,22 @@
 /*
- * UGVersion.h - release string and the cross-process status file path.
- * Shared by the tweak and the Preferences pane; keep both sides in step.
+ * UGVersion.h - release string and the cross-process file paths.
+ * Shared by the tweak and the Preferences pane; this header is the only place
+ * a version string or an on-disk path may be written, so the two processes
+ * cannot drift apart.
  */
 
 #ifndef UG_VERSION_H
 #define UG_VERSION_H
 
-#define UG_VERSION "1.0.2"
+#define UG_VERSION "1.0.3"
+
+/* Persisted cycle state, PIN vault and settings, written by the tweak/pane. */
+#define UG_PREFS_PATH "/var/mobile/Library/Preferences/org.usageguard.timelock.plist"
 
 /* Runtime heartbeat/state snapshot read by the Preferences pane. */
 #define UG_STATUS_PATH "/var/mobile/Library/Preferences/org.usageguard.timer.status.plist"
+
+/* Operator kill switch: while this file exists the runtime does nothing. */
+#define UG_KILLSWITCH_PATH "/var/mobile/Library/Preferences/org.usageguard.timer.disable"
 
 #endif /* UG_VERSION_H */

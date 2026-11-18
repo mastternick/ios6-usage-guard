@@ -1,4 +1,5 @@
 #import "UGPrefs.h"
+#import "UGVersion.h"
 
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonCryptor.h>
@@ -8,16 +9,14 @@
 #import <stdlib.h>
 #import <string.h>
 
-static NSString *const kUGPrefsPath =
-    @"/var/mobile/Library/Preferences/org.usageguard.timelock.plist";
+static NSString *const kUGPrefsPath = @UG_PREFS_PATH;
 
 /*
  * Operator kill switch. When this file exists the runtime does nothing at all
  * (no overlay, no hooks, no accounting, no PIN wizard). It is only ever created
  * or removed by the operator, never by the tweak itself.
  */
-static NSString *const kUGKillSwitchPath =
-    @"/var/mobile/Library/Preferences/org.usageguard.timer.disable";
+static NSString *const kUGKillSwitchPath = @UG_KILLSWITCH_PATH;
 
 static NSString *const kUGStateKey = @"State";
 static NSString *const kUGPINSaltKey = @"PINSalt";
