@@ -271,8 +271,9 @@ Theos stages into the bundle) and `src/UGVersion.h` all carry the same version.
 The validator then fails the package unless
 
 * the payload is exactly five files — the armv7 `MH_DYLIB` and its filter plist
-  under `Library/MobileSubstrate/DynamicLibraries/`, the armv7 `MH_BUNDLE`
-  `UsageGuardPrefs` and its `Info.plist` under
+  under `Library/MobileSubstrate/DynamicLibraries/`, the armv7 bundle executable
+  (`UsageGuardPrefs`; Theos links it with `-dynamiclib`, so it is accepted as
+  either `MH_DYLIB` or `MH_BUNDLE`) and its `Info.plist` under
   `Library/PreferenceBundles/UsageGuardPrefs.bundle/`, and the PreferenceLoader
   entry `Library/PreferenceLoader/Preferences/UsageGuard.plist`;
 * the filter plist names `com.apple.springboard` and the PreferenceLoader plist

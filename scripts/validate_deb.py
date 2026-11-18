@@ -54,7 +54,9 @@ What it enforces, on a single .deb:
     * LC_ID_DYLIB install name is /Library/MobileSubstrate/DynamicLibraries/<name>.dylib
 
   Mach-O (the preference bundle binary, tweak + preference bundle layout only)
-    * thin little-endian 32-bit Mach-O, filetype MH_BUNDLE
+    * thin little-endian 32-bit Mach-O, filetype MH_DYLIB or MH_BUNDLE (Theos
+      links the bundle with -dynamiclib, and PreferenceLoader loads either
+      through CFBundleExecutable; MH_EXECUTE and the rest are rejected)
     * cputype == 12 (CPU_TYPE_ARM), cpusubtype == 9 (CPU_SUBTYPE_ARM_V7)
     * LC_VERSION_MIN_IPHONEOS present with min OS 6.0.0
     * LC_CODE_SIGNATURE present
@@ -92,10 +94,19 @@ MH_MAGIC_BE = 0xFEEDFACE       # same value read big endian means byte-swapped
 
 CPU_TYPE_ARM = 12
 CPU_SUBTYPE_ARM_V7 = 9
+MH_OBJECT = 1
+MH_EXECUTE = 2
 MH_DYLIB = 6
 MH_BUNDLE = 8
 
-FILETYPE_NAMES = {MH_DYLIB: "MH_DYLIB", MH_BUNDLE: "MH_BUNDLE"}
+FILETYPE_NAMES = {MH_OBJECT: "MH_OBJECT", MH_EXECUTE: "MH_EXECUTE",
+                  MH_DYLIB: "MH_DYLIB", MH_BUNDLE: "MH_BUNDLE"}
+
+# Theos' bundle.mk links a preference bundle with -dynamiclib, so its
+# executable is a MH_DYLIB; a real MH_BUNDLE is equally loadable through
+# CFBundleExecutable. PreferenceLoader never inspects the filetype, so both
+# are accepted and everything else is rejected.
+BUNDLE_FILETYPES = (MH_DYLIB, MH_BUNDLE)
 
 LC_CODE_SIGNATURE = 0x1D
 LC_VERSION_MIN_IPHONEOS = 0x25
@@ -290,8 +301,15 @@ def architecture_errors(errors):
     return [e for e in errors if any(marker in e for marker in ARCHITECTURE_ERROR_MARKERS)]
 
 
+def filetype_label(filetype):
+    return FILETYPE_NAMES.get(filetype, "unknown filetype")
+
+
 def parse_macho(payload, expected_filetype=MH_DYLIB):
-    """Return (info_dict, [error strings]) for a Mach-O payload."""
+    """Return (info_dict, [error strings]) for a Mach-O payload.
+
+    ``expected_filetype`` is one filetype or a sequence of acceptable ones.
+    """
     errors = []
     info = {}
 
@@ -336,10 +354,14 @@ def parse_macho(payload, expected_filetype=MH_DYLIB):
         errors.append("cputype is %d, expected %d (CPU_TYPE_ARM)" % (cputype, CPU_TYPE_ARM))
     if subtype != CPU_SUBTYPE_ARM_V7:
         errors.append("cpusubtype is %d, expected %d (CPU_SUBTYPE_ARM_V7)" % (subtype, CPU_SUBTYPE_ARM_V7))
-    if filetype != expected_filetype:
-        errors.append("filetype is %d, expected %d (%s)"
-                      % (filetype, expected_filetype,
-                         FILETYPE_NAMES.get(expected_filetype, "?")))
+    accepted = (expected_filetype
+                if isinstance(expected_filetype, (list, tuple, set, frozenset))
+                else (expected_filetype,))
+    if filetype not in accepted:
+        errors.append("filetype is %d (%s), expected %s"
+                      % (filetype, filetype_label(filetype),
+                         " or ".join("%d (%s)" % (want, filetype_label(want))
+                                     for want in accepted)))
 
     offset = 28
     end = 28 + sizeofcmds
@@ -448,17 +470,20 @@ def validate_preference_bundle(report, payload_files):
     bundle_key = "%s/%s" % (BUNDLE_DIR, PREFERENCE_BUNDLE)
     bundle_payload = payload_files.get(bundle_key)
     if bundle_payload is None:
-        for name in ("bundle binary is armv7 MH_BUNDLE",
+        for name in ("bundle binary is armv7 MH_DYLIB or MH_BUNDLE",
                      "bundle LC_VERSION_MIN_IPHONEOS 6.0.0",
                      "bundle LC_CODE_SIGNATURE present"):
             report.fail(name, "%s is missing from the payload" % bundle_key)
     else:
-        info, errors = parse_macho(bundle_payload, expected_filetype=MH_BUNDLE)
+        info, errors = parse_macho(bundle_payload, expected_filetype=BUNDLE_FILETYPES)
         unsigned = [e for e in errors if "LC_CODE_SIGNATURE" in e]
-        report.check("bundle binary is armv7 MH_BUNDLE", not architecture_errors(errors),
-                     "cputype=%s subtype=%s%s" % (info.get("cputype", "?"),
-                                                  info.get("cpusubtype", "?"),
-                                                  ", single-slice fat" if info.get("fat") else ""))
+        report.check("bundle binary is armv7 MH_DYLIB or MH_BUNDLE",
+                     not architecture_errors(errors),
+                     "filetype=%s (%s), cputype=%s subtype=%s%s"
+                     % (info.get("filetype", "?"),
+                        filetype_label(info.get("filetype", -1)),
+                        info.get("cputype", "?"), info.get("cpusubtype", "?"),
+                        ", single-slice fat" if info.get("fat") else ""))
         report.check("bundle LC_VERSION_MIN_IPHONEOS 6.0.0",
                      "min_os" in info and info["min_os"] == MIN_OS_REQUIRED,
                      "%d.%d.%d" % info["min_os"] if "min_os" in info else "missing")

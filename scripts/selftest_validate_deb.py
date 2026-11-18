@@ -103,8 +103,10 @@ def macho(cputype=12, cpusubtype=9, filetype=6, min_os=(6, 0, 0),
           id_dylib=True):
     """Build a minimal thin Mach-O dylib (or a fat wrapper when fat=True).
 
-    ``filetype=8`` together with ``id_dylib=False`` yields an MH_BUNDLE, i.e.
-    the preference bundle binary: a bundle has no LC_ID_DYLIB.
+    ``filetype`` is passed through untouched. Theos' bundle.mk links the
+    preference bundle with -dynamiclib, so the real executable is a MH_DYLIB
+    (6) carrying an LC_ID_DYLIB; a hand-built MH_BUNDLE (8) uses
+    ``id_dylib=False`` instead.
     """
     commands = b""
     ncmds = 0
@@ -302,6 +304,16 @@ def cases(tmpdir):
                                with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
                                           macho(filetype=8, id_dylib=False, code_signature=False)),
                                control=MAIN_CONTROL)
+    # What Theos actually produces: bundle.mk links with -dynamiclib, so the
+    # executable is a MH_DYLIB with an LC_ID_DYLIB and must validate.
+    main_bundle_dylib = deb("good-main-bundle-dylib",
+                            with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                       macho(filetype=6, install_base=PREFERENCE_BUNDLE)),
+                            control=MAIN_CONTROL)
+    main_bundle_exec = deb("bad-main-bundle-exec",
+                           with_entry(MAIN_ENTRIES, BUNDLE_BINARY_KEY,
+                                      macho(filetype=2, id_dylib=False)),
+                           control=MAIN_CONTROL)
     main_bad_prefs_plist = deb("bad-main-prefs-plist",
                                with_entry(MAIN_ENTRIES, "%s/%s.plist" % (PREFERENCES_DIR, MAIN_DYLIB),
                                           PREFERENCES_PLIST.replace(PREFERENCE_BUNDLE, "OtherPrefs").encode()),
@@ -370,8 +382,12 @@ def cases(tmpdir):
          "unexpected: %s/Extra.strings" % BUNDLE_DIR, []),
         ("main package with a two-file payload rejected", main_probe_payload, 1,
          "unexpected: %s/Synthetic.dylib" % DYLIB_DIR, []),
+        ("bundle executable as MH_DYLIB accepted", main_bundle_dylib, 0,
+         "filetype=6 (MH_DYLIB), cputype=12 subtype=9", []),
         ("arm64 bundle binary rejected", main_bundle_arm64, 1,
-         "bundle binary is armv7 MH_BUNDLE", []),
+         "bundle binary is armv7 MH_DYLIB or MH_BUNDLE", []),
+        ("MH_EXECUTE bundle binary rejected", main_bundle_exec, 1,
+         "filetype is 2 (MH_EXECUTE), expected 6 (MH_DYLIB) or 8 (MH_BUNDLE)", []),
         ("unsigned bundle binary rejected", main_bundle_unsigned, 1,
          "bundle LC_CODE_SIGNATURE", []),
         ("PreferenceLoader plist naming the wrong bundle rejected", main_bad_prefs_plist, 1,

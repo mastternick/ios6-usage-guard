@@ -395,20 +395,23 @@ jobs:
             echo "::error::Usage Guard build failed (exit $status); full make output is above and in build-logs/usage-guard-build.log"
             exit "$status"
           fi
-          # The aggregate Makefile stages the tweak, the preference bundle and
-          # the PreferenceLoader entry; show what was actually staged, and fail
-          # before packaging if the Settings entry is absent.
+          # Diagnostics only. Theos stages subproject installs separately, so
+          # .theos/_ can be partial here even when the packaged deb is complete;
+          # the authoritative payload check is scripts/validate_deb.py on the
+          # built deb below.
           echo "--- staged payload (.theos/_) ---"
           if [ ! -d .theos/_ ]; then
-            echo "::error::no staged payload at .theos/_; nothing was installed"
-            exit 1
-          fi
-          staged="$(find .theos/_ -type f | sort)"
-          printf '%s\n' "$staged"
-          if ! printf '%s\n' "$staged" \
-               | grep -qxF '.theos/_/Library/PreferenceLoader/Preferences/UsageGuard.plist'; then
-            echo "::error::staged payload is missing Library/PreferenceLoader/Preferences/UsageGuard.plist"
-            exit 1
+            echo "::warning::no staged payload at .theos/_; cannot list what make package staged (the built deb is still validated)"
+          else
+            staged="$(find .theos/_ -type f | sort)"
+            printf '%s\n' "$staged"
+            for required in \
+              Library/MobileSubstrate/DynamicLibraries/UsageGuard.dylib \
+              Library/PreferenceLoader/Preferences/UsageGuard.plist; do
+              if ! printf '%s\n' "$staged" | grep -qxF ".theos/_/$required"; then
+                echo "::warning::staged payload does not list $required (the built deb is validated by scripts/validate_deb.py)"
+              fi
+            done
           fi
           set -- packages/*.deb
           if [ ! -e "$1" ]; then
