@@ -9,7 +9,7 @@
 		<key>bundle</key>
 		<string>UsageGuardPrefs</string>
 		<key>detail</key>
-		<string>UGPreferencesController</string>
+		<string>UGPreferencesListController</string>
 		<key>isController</key>
 		<true/>
 		<key>label</key>

@@ -70,7 +70,7 @@ jobs:
       - name: Verify version consistency
         run: |
           set -euo pipefail
-          want="1.0.4"
+          want="1.0.5"
           fail=0
 
           report() {  # $1 file, $2 extracted value, $3 label
@@ -130,7 +130,7 @@ jobs:
           # The Settings pane must take the version from src/UGVersion.h. A
           # literal in the pane is the one place CI cannot see: it compiles and
           # the next version bump silently ships a pane that reports the old one.
-          pane_sources="prefs/UGPreferencesController.m prefs/UGSettingsIPC.m"
+          pane_sources="prefs/UGPreferencesListController.m prefs/UGPreferencesController.m prefs/UGSettingsIPC.m"
           pane_uses_version=0
           for pane_source in $pane_sources; do
             if [ ! -f "$pane_source" ]; then
@@ -149,7 +149,7 @@ jobs:
             fi
           done
           if [ "$pane_uses_version" -ne 1 ]; then
-            echo "::error::neither prefs/UGPreferencesController.m nor prefs/UGSettingsIPC.m references UG_VERSION; the pane must include src/UGVersion.h"
+            echo "::error::none of $pane_sources references UG_VERSION; the pane sources must include src/UGVersion.h"
             fail=1
           fi
 

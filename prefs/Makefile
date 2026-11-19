@@ -11,7 +11,7 @@ ARCHS ?= armv7
 include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = UsageGuardPrefs
-UsageGuardPrefs_FILES = UGPreferencesController.m UGTrace.m UGSettingsIPC.m ../src/UGPrefs.m ../src/UGGuardCore.c
+UsageGuardPrefs_FILES = UGPreferencesListController.m UGTrace.m UGSettingsIPC.m ../src/UGPrefs.m ../src/UGGuardCore.c
 UsageGuardPrefs_INSTALL_PATH = /Library/PreferenceBundles
 UsageGuardPrefs_CFLAGS = -fobjc-arc -I../src
 UsageGuardPrefs_FRAMEWORKS = UIKit Foundation Security

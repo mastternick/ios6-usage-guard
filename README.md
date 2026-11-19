@@ -9,7 +9,7 @@ repeating **use / break** cycle:
 
 Both durations are configurable from a PIN-protected parent panel, from the
 **Usage Guard** pane in Settings, and from the **Usage Guard** app on the home
-screen (the same pane, in a second host). The tweak runs inside SpringBoard, so
+screen (the same rows, in a second host). The tweak runs inside SpringBoard, so
 the break overlay appears above apps, the home screen, notifications and alerts
 regardless of what is in the foreground.
 
@@ -98,23 +98,30 @@ The package also installs a preference bundle
 entry (`/Library/PreferenceLoader/Preferences/UsageGuard.plist`), so a
 **Usage Guard** row appears at the bottom of `Settings`. The pane is the
 Settings half of the configuration UI; the package also installs a
-home-screen app that shows the same pane (see
+home-screen app that shows the same configuration (see
 [Configuration app](#configuration-app)), which is the fallback when
 Preferences.app itself is not usable. The entry is a real controller
 (`isController` plus
 `detail` in the entry plist, `NSPrincipalClass` in the bundle's `Info.plist`),
-so tapping the row pushes `UGPreferencesController` — in this bundle build a
-`PSViewController` subclass that builds its own grouped table view — instead of
-a dead link cell.
+so tapping the row pushes `UGPreferencesListController` — a `PSListController`
+subclass that describes its rows as `PSSpecifier` objects — instead of a dead
+link cell. Preferences.app itself renders, scrolls, reloads and localises that
+table; the pane only answers which rows exist and what each row currently
+says, so the private table machinery stays on Apple's side of the line.
 The pane has five sections, top to bottom:
 
 | section | rows |
 | --- | --- |
-| **Status** | `Usage Guard activ` switch; `Stare` (current phase); `Utilizare rămasă`; `Pauză rămasă`; `Runtime: activ (pid N)` or `Runtime: nu este detectat` |
+| **Status** | `Usage Guard activ` switch; `Stare` (current phase); `Utilizare rămasă`; `Pauză rămasă`; `Runtime: activ (pid N)`, `Runtime: inactiv (pornit)` or `Runtime: nu este detectat` |
 | **Time Limits** | `Utilizare (minute)` and `Pauză (minute)`, 1–240 each, edited through a prompt |
 | **Actions** | `Începe pauza acum`, `Resetează ciclul`, `Pauză 15 min`, `Pauză 30 min`, `Pauză 60 min`, `Reia restricțiile`, `Testează ecranul de blocare` |
 | **Security** | `Schimbă codul PIN` (`Setează un cod PIN` when none is stored) and the `Cere PIN pentru modificări` switch |
-| **Information** | tweak version, runtime, bundle version, preferences path, `Jurnal` (trace path and size), status-file age, kill-switch state, `DebugLogging` state, `Șterge jurnalul` |
+| **Information** | tweak version, runtime, bundle version, preferences path, status-file age, `Jurnal` (trace path and size), `Șterge jurnalul` |
+
+The pane does not carry separate kill-switch or `DebugLogging` rows: `Stare`
+reads `Disponibil` while the runtime reports inert or the kill-switch marker
+exists, and the configuration app's Information section keeps explicit
+`Kill switch` and `Jurnalizare (DebugLogging)` rows for the same facts.
 
 The pane keeps no copy of the state: every read reloads the preferences file and
 every change is a read-modify-write that is announced to SpringBoard (see
@@ -160,14 +167,17 @@ is validated as exactly seven files, so a new icon also has to be added to the
 validator's `MAIN_PAYLOAD_FILES` list (see
 [Build — GitHub Actions](#build--github-actions-no-local-toolchain)).
 
-The app is **the configuration UI, not the enforcer**. It compiles the same
-`UGPreferencesController` source the Settings pane uses, with
-`-DUG_HOST_APP=1` — same `initForContentSize:` initialiser, same rows — but its
-base class is a local `UGControllerBase` (a plain `UIViewController`) rather
-than the Settings host's `PSViewController`, which only exists inside
-Preferences.app and is never linked here. It is wrapped in a navigation
-controller, so nothing can drift between the two hosts. SpringBoard's tweak
-still does all the accounting, the overlay and the PIN work.
+The app is **the configuration UI, not the enforcer**. It compiles the
+`UGPreferencesController` source with `-DUG_HOST_APP=1` — the app's own
+hand-built grouped table view over the same rows, with the same
+`initForContentSize:` initialiser — and its base class is a local
+`UGControllerBase` (a plain `UIViewController`) rather than any Preferences
+class, which only exists inside Preferences.app and is never linked here. It is
+wrapped in a navigation controller. The two hosts do not share Preferences'
+controller machinery at all: they share `UGSettingsIPC` (the preferences file
+and the Darwin announcements) and each builds its own rows over it.
+SpringBoard's tweak still does all the accounting, the overlay and the PIN
+work.
 
 The app keeps no state of its own. It reads and writes the **same preferences
 file** (`/var/mobile/Library/Preferences/org.usageguard.timelock.plist`) and
@@ -215,7 +225,7 @@ upgrading does not re-run the wizard; a device that never stored a PIN still
 gets the first-run wizard.
 
 Setup runs from Settings → Usage Guard (or from the **Usage Guard** app on the
-home screen, which hosts the same pane — see
+home screen, which runs the same wizard over its own pane — see
 [Configuration app](#configuration-app)): the wizard opens the first time the
 pane is shown. The overlay's seven-tap parent panel is *not* a setup path — the
 overlay only appears once a break is running or through `Testează ecranul de
@@ -267,10 +277,12 @@ evidence the pane has; it never assumes the tweak is running.
 
 `DebugLogging` (a boolean in the preferences plist) turns on a small number of
 `NSLog` lines — startup, hook count, corrupt state, PIN lockout — that appear
-after a respring. The Information section of the pane shows its state, along
-with the tweak version, the bundle version, the preferences path, the status
-file age and the kill-switch state, which is usually enough to tell "not
-installed" from "installed but inert".
+after a respring. The pane's Information section shows the tweak version, the
+bundle version, the preferences path and the status file age, while its `Stare`
+row turns `Disponibil` when the runtime reports inert or the kill switch is
+present; the app's Information section adds explicit `Kill switch` and
+`Jurnalizare (DebugLogging)` rows. Together they are usually enough to tell
+"not installed" from "installed but inert".
 
 The status file is the first thing to read when something looks wrong: copy
 `/var/mobile/Library/Preferences/org.usageguard.timer.status.plist` off the
@@ -283,7 +295,7 @@ respring is expected until the new runtime writes its first snapshot.
 ### Local trace (Settings pane)
 
 The pane cannot be observed without SSH: Preferences.app is a separate process
-and its crash reports are not reachable from a desktop sync tool. The 1.0.4
+and its crash reports are not reachable from a desktop sync tool. The 1.0.5
 bundle therefore keeps its own trace at
 
 ```
@@ -301,17 +313,17 @@ fresh pid after every respring, which is how a restart can be told from a crash
 in the same session. The bundle records, in order: `+load` of the controller
 (naming the `UsageGuardPrefs.bundle` copy the host loaded), `+load` of the trace
 installer (`bundle loaded:` with the same path, once the exception handler is
-installed), `initForContentSize:` (with the result of `respondsToSelector:` for
-`setSpecifier:`, `setRootController:`, `setParentController:` and
-`viewWillBecomeVisible:`), `loadView` and table installation, `viewDidLoad`,
-`viewWillAppear:`, `viewDidAppear:` (with `setupComplete` and `hasPIN`), the
-table cells of the rebuild that follows `viewWillAppear:` (at most sixteen per
-rebuild, section and row only - never cell text; the 1 Hz refresh does not trace
-rows, so the file is not flooded and the earlier record survives), every row
-selection, every action handler, every alert presented and dismissed (tag and
-button index), `viewWillDisappear:`, `clearAuthorization` (including whether an
-alert was live) and `dealloc`. It also installs an
-`NSSetUncaughtExceptionHandler`, so an uncaught exception appends
+installed), `initForContentSize:` (entry and exit), `viewWillAppear:` (with the
+specifier count), `viewDidAppear:` (with `setupComplete` and `hasPIN`), every
+action handler and every switch setter, every alert presented and dismissed (tag
+and button index), `viewWillDisappear:`, `clearAuthorization` (including whether
+an alert was live) and `dealloc`. The pane's lines start with `list `. The app's
+`UGPreferencesController` writes the same lifecycle lines without that prefix,
+plus its `loadView` and table installation and one line per row of each rebuild
+(at most sixteen per rebuild, section and row only - never cell text; the 1 Hz
+refresh does not trace rows, so the file is not flooded and the earlier record
+survives), which is how the two hosts can be told apart in one file. It also
+installs an `NSSetUncaughtExceptionHandler`, so an uncaught exception appends
 
 ```
 EXCEPTION <name>: <reason>
@@ -387,7 +399,8 @@ layout/Library/PreferenceLoader/Preferences/UsageGuard.plist
 layout/DEBIAN/postinst  maintainer script: runs uicache so the home-screen entry appears
 prefs/                  preference bundle sources and resources
 prefs/Resources/Info.plist  the bundle's Info.plist (staged into the bundle)
-prefs/UGPreferencesController.{h,m}  the grouped Settings pane (shared with the app)
+prefs/UGPreferencesListController.{h,m}  the Settings pane (PSListController + PSSpecifier, rendered by Preferences)
+prefs/UGPreferencesController.{h,m}  the app's pane (same rows, own table view, -DUG_HOST_APP=1)
 prefs/UGTrace.{h,m}                  line-oriented trace log + uncaught-exception record
 prefs/UGSettingsIPC.{h,m}            plist access and Darwin announcements
 app/                    the /Applications configuration app
@@ -422,7 +435,7 @@ uploads:
 
 | artifact | contents |
 | --- | --- |
-| `usage-guard-deb` | `org.usageguard.timer_1.0.4_iphoneos-arm.deb` — install this |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.5_iphoneos-arm.deb` — install this |
 | `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
 | `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
 
@@ -437,9 +450,10 @@ Validation is enforced, not advisory: before building, the pipeline fails unless
 `control`, the preference bundle's `Info.plist` (`prefs/Resources/Info.plist`,
 the file Theos stages into the bundle), the app's `Info.plist`
 (`app/Resources/Info.plist`) and `src/UGVersion.h` all carry the same version,
-and unless the pane takes that version from the header — a hard-coded `1.0.4`
-literal in `prefs/UGPreferencesController.m` or `prefs/UGSettingsIPC.m` fails
-the build. The same step also fails if
+and unless the pane takes that version from the header — a hard-coded `1.0.5`
+literal in `prefs/UGPreferencesListController.m`,
+`prefs/UGPreferencesController.m` or `prefs/UGSettingsIPC.m` fails the build.
+The same step also fails if
 `org.usageguard.timelock.plist`, `org.usageguard.timer.status.plist` or
 `org.usageguard.timer.disable` appears anywhere under `src/` or `prefs/`
 outside `src/UGVersion.h`, so the release version and those plist paths have
@@ -488,7 +502,7 @@ make package FINALPACKAGE=1
 ```
 
 The package is written to `packages/` as
-`org.usageguard.timer_1.0.4_iphoneos-arm.deb`. The tweak targets
+`org.usageguard.timer_1.0.5_iphoneos-arm.deb`. The tweak targets
 `iphone:clang:6.1:6.0`, `ARCHS = armv7` (iPhone 4S / iPad 2 class hardware).
 
 ### Host tests (no Theos, no device)
@@ -514,9 +528,9 @@ Copy the built `.deb` to the device and install it with dpkg, then respring or
 restart SpringBoard:
 
 ```sh
-scp packages/org.usageguard.timer_1.0.4_iphoneos-arm.deb root@DEVICE_IP:/var/root/
+scp packages/org.usageguard.timer_1.0.5_iphoneos-arm.deb root@DEVICE_IP:/var/root/
 ssh root@DEVICE_IP \
-  'dpkg -i /var/root/org.usageguard.timer_1.0.4_iphoneos-arm.deb && killall -9 SpringBoard'
+  'dpkg -i /var/root/org.usageguard.timer_1.0.5_iphoneos-arm.deb && killall -9 SpringBoard'
 ```
 
 A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'
@@ -567,8 +581,10 @@ methods (or, if they were already installed, they simply call the original), no
 usage accounting and no PIN wizard. The check runs on every 1 Hz tick, so the
 device is usable about a second after the file appears — no respring needed.
 The marker is only ever read, never created, modified or deleted by the tweak.
-The `Kill switch` row in the Settings pane's Information section shows whether
-the marker is currently seen, so its state is visible without a shell.
+The pane's `Stare` row reads `Disponibil` (and the `Runtime` row reports
+`Runtime: inactiv (pornit)`) while the marker is seen, so its state is visible
+without a shell; the configuration app's Information section keeps an explicit
+`Kill switch` row as well.
 
 Remove the file and respring to re-enable it (a running runtime also picks the
 removal up within a second):
@@ -607,9 +623,10 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   should already be on the device. Once the entry shows, expect SpringBoard's
   generic placeholder icon: no icon asset ships.
 * **Settings closes when the pane opens, or the pane cannot be reached.** Use
-  the **Usage Guard** app on the home screen: it compiles the identical
-  `UGPreferencesController` source, so every row works the same and a change is
-  announced to SpringBoard the same way. Both hosts append to
+  the **Usage Guard** app on the home screen: it carries its own implementation
+  of the same rows (`UGPreferencesController`, compiled with `-DUG_HOST_APP=1`)
+  and never links a Preferences controller class, so every row works the same
+  and a change is announced to SpringBoard the same way. Both hosts append to
   `/var/mobile/Library/Preferences/org.usageguard.timer.trace.log`; copy it off
   the device to see which host got how far (see
   [Local trace](#local-trace-settings-pane)).
@@ -694,6 +711,16 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   change: the validator requires the payload to be exactly seven files, so
   `Icon.png`/`Icon@2x.png` would also have to be added to its
   `MAIN_PAYLOAD_FILES` list, and CI would fail the package until they are.
+* **The `PSListController` pane is unverified on device.** The pane now uses
+  Apple's own list-controller and `PSSpecifier` contract instead of a hand-built
+  table, which removes the dependency on Preferences' private table machinery
+  but is itself untested on an iOS 6 device: CI cross-builds the bundle and the
+  validator only checks the entry plist, so nothing in this repository has
+  loaded `UGPreferencesListController` in a real Preferences.app. The
+  configuration app is the fallback precisely because that path is independent
+  of Preferences' controller machinery — it compiles `UGPreferencesController`
+  with `-DUG_HOST_APP=1` and links no Preferences class — so a pane failure
+  still leaves a working configuration UI.
 * **No physical-device test was performed for this release.** CI cross-builds
   the package, `scripts/validate_deb.py` checks the payload statically and the
   host C tests cover the cycle engine; nothing in this repository exercises the
