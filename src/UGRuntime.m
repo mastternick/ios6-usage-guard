@@ -395,9 +395,8 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
  * The MobileSubstrate constructor can fire before UIApplicationMain has built
  * the application object. Activating then would create the overlay window on a
  * half-built SpringBoard, which a boot-time crash could turn into a respring
- * loop. Wait for UIApplication to exist, preferring the launch notification,
- * and fall back to a bounded poll so a late injection can never leave the
- * runtime dormant.
+ * loop. Poll for UIApplication on the main queue, bounded at 3 s, so a late
+ * injection can never leave the runtime dormant.
  */
 - (void)activateWhenApplicationReady:(NSInteger)attempt
 {
