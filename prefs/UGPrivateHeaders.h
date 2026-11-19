@@ -25,19 +25,27 @@
 @end
 
 /*
- * Cell types used by a Preferences table. These are the values the host's
- * PSTableCell implementation compares against on iOS 6; the names come from
- * Apple's own specifier plists. Choosing the wrong constant yields a cell that
- * draws nothing useful, so they are spelled out rather than inlined.
+ * Cell types used by a Preferences table. These are the values of the
+ * PSCellType enum in the host's PSTableCell.h on iOS 6; the numbers, not the
+ * names, are what the host compares against. Choosing the wrong constant
+ * yields a cell that draws the wrong control (a slider instead of a value, an
+ * edit field instead of static text), so the full enum is spelled out here.
  */
 enum {
     PSGroupCell = 0,
     PSLinkCell = 1,
-    PSButtonCell = 2,
-    PSLinkListCell = 3,
-    PSTitleValueCell = 5,
+    PSLinkListCell = 2,
+    PSListItemCell = 3,
+    PSTitleValueCell = 4,
+    PSSliderCell = 5,
     PSSwitchCell = 6,
-    PSStaticTextCell = 8
+    PSStaticTextCell = 7,
+    PSEditTextCell = 8,
+    PSSegmentCell = 9,
+    PSGiantIconCell = 10,
+    PSGiantCell = 11,
+    PSSecureEditTextCell = 12,
+    PSButtonCell = 13
 };
 
 /*
@@ -62,8 +70,18 @@ enum {
  * The host's specifier-driven table controller. Its own view/table machinery
  * renders and reloads the rows, so the pane no longer builds a UITableView by
  * hand.
+ *
+ * `_specifiers` is the host's own storage for the rows it renders: since iOS 4
+ * Preferences builds its groups from this ivar, so a subclass must publish the
+ * list there, not merely return it from -specifiers. The ivar is declared here
+ * only so the compiler knows its type; the non-fragile ABI resolves the access
+ * to _OBJC_IVAR_$_PSListController._specifiers against the real Preferences
+ * class when the bundle is loaded (-Wl,-undefined,dynamic_lookup). PSListController
+ * is not linked, so this declaration must match the host's layout by name.
  */
-@interface PSListController : PSViewController
+@interface PSListController : PSViewController {
+    NSArray *_specifiers;
+}
 - (NSArray *)specifiers;
 - (void)reloadSpecifiers;
 - (void)reload;

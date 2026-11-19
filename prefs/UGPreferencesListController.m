@@ -94,11 +94,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     NSString *_signature;
     NSTimer *_refreshTimer;
 
-    /* The array handed to the host, built once and then refreshed in place.
-     * Preferences caches the array it was given, so a row's specifier object
-     * has to stay alive and be updated rather than replaced: the visible text
-     * of these few rows is not driven by a get selector. */
-    NSArray *_ugSpecifiers;
+    /* Rows whose visible text is not driven by a get selector. They live in
+     * the host's _specifiers array and are updated in place, so renaming them
+     * keeps the array (and its ids) stable. */
     PSSpecifier *_runtimeTextSpecifier;
     PSSpecifier *_editUsageSpecifier;
     PSSpecifier *_editBreakSpecifier;
@@ -199,16 +197,16 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
 - (void)viewWillAppear:(BOOL)animated
 {
-    UGTrace(@"list viewWillAppear: entry specifiers=%ld", (long)_ugSpecifiers.count);
+    UGTrace(@"list viewWillAppear: entry specifiers=%ld", (long)_specifiers.count);
 
     [super viewWillAppear:animated];
     self.title = @"Usage Guard";
 
-    /* Force one rebuild: the host may have installed the list before the
-     * state was ever read. */
+    /* Make sure the host's array exists, then refresh it from the state that
+     * may have changed while the pane was away. */
     _signature = nil;
-    [self ugReloadLiveState];
-    [self reloadSpecifiers];
+    [self specifiers];
+    [self ugReloadAndDisplay];
     [self ugStartRefreshTimer];
 
     UGTrace(@"list viewWillAppear: exit");
@@ -233,7 +231,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
     [self ugStopRefreshTimer];
     [NSObject cancelPreviousPerformRequestsWithTarget:self
-                                             selector:@selector(reloadSpecifiers)
+                                             selector:@selector(ugReloadAndDisplay)
                                                object:nil];
 
     /* Whatever was on screen is gone with the pane; start clean next time. */
@@ -338,7 +336,11 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     [self ugReloadLiveState];
     if ([previous isEqualToString:_signature]) return;
 
-    [self reloadSpecifiers];
+    /* Cheap refresh: rename the rows that need it in place and let the host
+     * redraw its table. A full specifier rebuild every second would drop a
+     * switch mid-drag and interrupt taps. */
+    [self ugRefreshSpecifierContent];
+    [self reload];
 }
 
 /* Reads cycle state and the runtime heartbeat, then refreshes the signature.
@@ -376,53 +378,40 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (void)ugReloadAndDisplay
 {
     [self ugReloadLiveState];
-    [self reloadSpecifiers];
+    [self ugRefreshSpecifierContent];
+    [self reload];
 }
 
-/* Deferred rebuild for the one case where the row has to contradict itself for
+/* Deferred refresh for the one case where the row has to contradict itself for
  * a moment: a switch that the parent just turned off is already drawn off while
  * the PIN prompt is up, so the row is restored from persisted state. */
 - (void)ugScheduleReload
 {
     [NSObject cancelPreviousPerformRequestsWithTarget:self
-                                             selector:@selector(reloadSpecifiers)
+                                             selector:@selector(ugReloadAndDisplay)
                                                object:nil];
-    [self performSelector:@selector(reloadSpecifiers) withObject:nil afterDelay:0.0];
+    [self performSelector:@selector(ugReloadAndDisplay) withObject:nil afterDelay:0.0];
 }
 
 #pragma mark - Specifiers
 
 /*
- * The host calls this whenever it installs or reloads the list. The array is
- * built once and every row's content is then recomputed from live state on
- * each call, which is what keeps the row labels and the switch positions
- * truthful after a write made elsewhere.
+ * The host, not this method's return value, decides what the table shows: since
+ * iOS 4 Preferences builds its groups from PSListController's own _specifiers
+ * ivar, so the row array has to be published there. Returning a private array
+ * from this method alone leaves the host with an empty pane. The ivar is
+ * declared in the faked PSListController interface and bound to the real
+ * Preferences class at load time (non-fragile ABI, dynamic lookup).
  *
- * Rows whose text comes from a get selector update themselves when the host
- * redraws. The few rows that have no get selector (the runtime line, the two
- * limit buttons, the PIN button and the PIN switch's enabled flag) are updated
- * on their existing PSSpecifier objects, so the array Preferences cached keeps
- * telling the truth whether or not its reload asks for this method again.
+ * The list is built once; rows whose text has no get selector are renamed in
+ * place, so a reload never replaces the objects the host is using.
  */
 - (NSArray *)specifiers
 {
-    [self ugReloadLiveState];
-
-    if (!_ugSpecifiers) {
-        _ugSpecifiers = [self ugBuildSpecifiers];
+    if (!_specifiers) {
+        _specifiers = [self ugBuildSpecifiers];
     }
-    [self ugRefreshSpecifierContent];
-
-    return _ugSpecifiers;
-}
-
-- (void)reloadSpecifiers
-{
-    /* Refresh first: the host's table reload reads the specifiers it cached
-     * when this controller was installed, and those are the objects the
-     * refresh just updated. */
-    [self specifiers];
-    [super reloadSpecifiers];
+    return _specifiers;
 }
 
 - (void)ugRefreshSpecifierContent
@@ -498,66 +487,99 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     return specifier;
 }
 
+- (PSSpecifier *)ugIdentify:(PSSpecifier *)specifier as:(NSString *)identifier
+{
+    /* PSSpecifier keys rows by this property. Names change at runtime (the
+     * runtime line, both limits, the PIN button), so a name-derived key would
+     * go stale and the group header would collide with the "Stare" row. */
+    [specifier setProperty:identifier forKey:@"id"];
+    return specifier;
+}
+
 - (NSArray *)ugBuildSpecifiers
 {
-    NSMutableArray *rows = [NSMutableArray arrayWithCapacity:26];
+    NSMutableArray *rows = [NSMutableArray arrayWithCapacity:28];
 
     /* Stare */
-    [rows addObject:[self ugGroupSpecifierNamed:@"Stare"]];
-    [rows addObject:[self ugSwitchSpecifierNamed:@"Usage Guard activ"
-                                             set:@selector(setEnabled:specifier:)
-                                             get:@selector(enabledForSpecifier:)]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Stare"
-                                            get:@selector(phaseDescriptionForSpecifier:)]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Utilizare rămasă"
-                                            get:@selector(usageRemainingForSpecifier:)]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Pauză rămasă"
-                                            get:@selector(breakRemainingForSpecifier:)]];
-    _runtimeTextSpecifier = [self ugTextSpecifierNamed:[self runtimeDescription]];
+    [rows addObject:[self ugIdentify:[self ugGroupSpecifierNamed:@"Stare"]
+                                  as:@"status.group"]];
+    [rows addObject:[self ugIdentify:[self ugSwitchSpecifierNamed:@"Usage Guard activ"
+                                                               set:@selector(setEnabled:specifier:)
+                                                               get:@selector(enabledForSpecifier:)]
+                                  as:@"status.enabled"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Stare"
+                                                             get:@selector(phaseDescriptionForSpecifier:)]
+                                  as:@"status.phase"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Utilizare rămasă"
+                                                             get:@selector(usageRemainingForSpecifier:)]
+                                  as:@"status.usageLeft"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Pauză rămasă"
+                                                             get:@selector(breakRemainingForSpecifier:)]
+                                  as:@"status.breakLeft"]];
+    _runtimeTextSpecifier =
+        [self ugIdentify:[self ugTextSpecifierNamed:[self runtimeDescription]]
+                      as:@"status.runtime"];
     [rows addObject:_runtimeTextSpecifier];
 
     /* Limite de timp */
-    [rows addObject:[self ugGroupSpecifierNamed:@"Limite de timp"]];
-    _editUsageSpecifier = [self ugButtonSpecifierNamed:
-                           [NSString stringWithFormat:@"Utilizare (minute): %d",
-                                                       _state.usageMinutes]
-                                                       action:@selector(ugEditUsageMinutes)];
+    [rows addObject:[self ugIdentify:[self ugGroupSpecifierNamed:@"Limite de timp"]
+                                  as:@"limits.group"]];
+    _editUsageSpecifier =
+        [self ugIdentify:[self ugButtonSpecifierNamed:
+                            [NSString stringWithFormat:@"Utilizare (minute): %d",
+                                                        _state.usageMinutes]
+                                                action:@selector(ugEditUsageMinutes)]
+                      as:@"limits.usage"];
     [rows addObject:_editUsageSpecifier];
-    _editBreakSpecifier = [self ugButtonSpecifierNamed:
-                           [NSString stringWithFormat:@"Pauză (minute): %d",
-                                                       _state.breakMinutes]
-                                                       action:@selector(ugEditBreakMinutes)];
+    _editBreakSpecifier =
+        [self ugIdentify:[self ugButtonSpecifierNamed:
+                            [NSString stringWithFormat:@"Pauză (minute): %d",
+                                                        _state.breakMinutes]
+                                                action:@selector(ugEditBreakMinutes)]
+                      as:@"limits.break"];
     [rows addObject:_editBreakSpecifier];
 
     /* Acțiuni */
-    [rows addObject:[self ugGroupSpecifierNamed:@"Acțiuni"]];
-    [rows addObject:[self ugButtonSpecifierNamed:@"Începe pauza acum"
-                                          action:@selector(ugStartBreakNow)]];
-    [rows addObject:[self ugButtonSpecifierNamed:@"Resetează ciclul"
-                                          action:@selector(ugResetCycle)]];
-    [rows addObject:[self ugButtonSpecifierNamed:@"Pauză 15 min"
-                                          action:@selector(ugPauseFifteenMinutes)]];
-    [rows addObject:[self ugButtonSpecifierNamed:@"Pauză 30 min"
-                                          action:@selector(ugPauseThirtyMinutes)]];
-    [rows addObject:[self ugButtonSpecifierNamed:@"Pauză 60 min"
-                                          action:@selector(ugPauseSixtyMinutes)]];
-    [rows addObject:[self ugButtonSpecifierNamed:@"Reia restricțiile"
-                                          action:@selector(ugResumeRestrictions)]];
-    [rows addObject:[self ugButtonSpecifierNamed:@"Testează ecranul de blocare"
-                                          action:@selector(ugTestOverlay)]];
+    [rows addObject:[self ugIdentify:[self ugGroupSpecifierNamed:@"Acțiuni"]
+                                  as:@"actions.group"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Începe pauza acum"
+                                                           action:@selector(ugStartBreakNow)]
+                                  as:@"actions.startBreak"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Resetează ciclul"
+                                                           action:@selector(ugResetCycle)]
+                                  as:@"actions.reset"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Pauză 15 min"
+                                                           action:@selector(ugPauseFifteenMinutes)]
+                                  as:@"actions.pause15"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Pauză 30 min"
+                                                           action:@selector(ugPauseThirtyMinutes)]
+                                  as:@"actions.pause30"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Pauză 60 min"
+                                                           action:@selector(ugPauseSixtyMinutes)]
+                                  as:@"actions.pause60"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Reia restricțiile"
+                                                           action:@selector(ugResumeRestrictions)]
+                                  as:@"actions.resume"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Testează ecranul de blocare"
+                                                           action:@selector(ugTestOverlay)]
+                                  as:@"actions.testOverlay"]];
 
     /* Securitate */
-    [rows addObject:[self ugGroupSpecifierNamed:@"Securitate"]];
-    _pinButtonSpecifier = [self ugButtonSpecifierNamed:
-                           ([[self ugIPC] hasPIN] ? @"Schimbă codul PIN"
-                                                   : @"Setează un cod PIN")
-                                                   action:@selector(ugChangePIN)];
+    [rows addObject:[self ugIdentify:[self ugGroupSpecifierNamed:@"Securitate"]
+                                  as:@"security.group"]];
+    _pinButtonSpecifier =
+        [self ugIdentify:[self ugButtonSpecifierNamed:
+                            ([[self ugIPC] hasPIN] ? @"Schimbă codul PIN"
+                                                    : @"Setează un cod PIN")
+                                                action:@selector(ugChangePIN)]
+                      as:@"security.pin"];
     [rows addObject:_pinButtonSpecifier];
 
     _requirePINSpecifier =
-        [self ugSwitchSpecifierNamed:@"Cere PIN pentru modificări"
-                                 set:@selector(setRequirePIN:specifier:)
-                                 get:@selector(requirePINForSpecifier:)];
+        [self ugIdentify:[self ugSwitchSpecifierNamed:@"Cere PIN pentru modificări"
+                                                  set:@selector(setRequirePIN:specifier:)
+                                                  get:@selector(requirePINForSpecifier:)]
+                      as:@"security.requirePIN"];
     /* A switch that cannot be honoured (no PIN stored yet) is greyed out by the
      * host when the specifier carries enabled = NO. */
     [_requirePINSpecifier setProperty:[NSNumber numberWithBool:[[self ugIPC] hasPIN]]
@@ -565,21 +587,29 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     [rows addObject:_requirePINSpecifier];
 
     /* Informații */
-    [rows addObject:[self ugGroupSpecifierNamed:@"Informații"]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Versiune Usage Guard"
-                                            get:@selector(versionForSpecifier:)]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Runtime"
-                                            get:@selector(runtimeForSpecifier:)]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Versiune pachet"
-                                            get:@selector(bundleVersionForSpecifier:)]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Fișier preferințe"
-                                            get:@selector(preferencesPathForSpecifier:)]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Stare runtime"
-                                            get:@selector(statusAgeForSpecifier:)]];
-    [rows addObject:[self ugValueSpecifierNamed:@"Jurnal"
-                                            get:@selector(traceLogForSpecifier:)]];
-    [rows addObject:[self ugButtonSpecifierNamed:@"Șterge jurnalul"
-                                          action:@selector(ugDeleteTraceLog)]];
+    [rows addObject:[self ugIdentify:[self ugGroupSpecifierNamed:@"Informații"]
+                                  as:@"info.group"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Versiune Usage Guard"
+                                                             get:@selector(versionForSpecifier:)]
+                                  as:@"info.version"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Runtime"
+                                                             get:@selector(runtimeForSpecifier:)]
+                                  as:@"info.runtime"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Versiune pachet"
+                                                             get:@selector(bundleVersionForSpecifier:)]
+                                  as:@"info.bundleVersion"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Fișier preferințe"
+                                                             get:@selector(preferencesPathForSpecifier:)]
+                                  as:@"info.preferencesPath"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Stare runtime"
+                                                             get:@selector(statusAgeForSpecifier:)]
+                                  as:@"info.statusAge"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Jurnal"
+                                                             get:@selector(traceLogForSpecifier:)]
+                                  as:@"info.traceLog"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Șterge jurnalul"
+                                                           action:@selector(ugDeleteTraceLog)]
+                                  as:@"info.clearTraceLog"]];
 
     return rows;
 }
@@ -923,7 +953,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 {
     UGTrace(@"list action: delete trace log size=%llu", UGTraceFileSize());
     UGTraceRemoveLog();
-    [self reloadSpecifiers];
+    /* Only the Jurnal row's value changes, and that comes from its get
+     * selector: a table reload is enough. */
+    [self reload];
 }
 
 #pragma mark - Authorization
@@ -1461,6 +1493,18 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     if (alertView == _activeAlert) _activeAlert = nil;
     _resumeAfterNotice = nil;
     _pendingAuthorizedAction = nil;
+}
+
+/*
+ * PSListController implements this delegate method for its own confirmation
+ * sheets; our alerts must not reach that handler, which would act on button
+ * indices it did not create. The dismissal work happens in
+ * didDismissWithButtonIndex:, which runs after the button has been released.
+ */
+- (void)alertView:(UIAlertView *)alertView clickedButtonAtIndex:(NSInteger)buttonIndex
+{
+    (void)alertView;
+    (void)buttonIndex;
 }
 
 - (void)alertView:(UIAlertView *)alertView didDismissWithButtonIndex:(NSInteger)buttonIndex

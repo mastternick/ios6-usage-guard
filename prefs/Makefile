@@ -20,8 +20,10 @@ UsageGuardPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup -Wl,-bundle
 # A .bundle must carry MH_BUNDLE. Theos links an instance with -dynamiclib by
 # default, which produces an MH_DYLIB (and a stray LC_ID_DYLIB install name) in
 # a file Preferences.app only dlopen()s; opt out so it is linked -bundle.
-# dynamic_lookup above must stay: _OBJC_CLASS_$_PSViewController has to remain
-# undefined and resolve at load time against the host application.
+# dynamic_lookup above must stay: _OBJC_CLASS_$_PSListController,
+# _OBJC_CLASS_$_PSSpecifier and the _OBJC_IVAR_$_PSListController._specifiers
+# offset have to remain undefined and resolve at load time against the host
+# application; the bundle links no Preferences framework of its own.
 UsageGuardPrefs_DYNAMIC_LIBRARY = NO
 
 include $(THEOS_MAKE_PATH)/bundle.mk
