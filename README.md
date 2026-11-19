@@ -19,8 +19,12 @@ During a break the whole screen is replaced with:
 
 * **Pauză de la telefon!**
 * **Mai ai 20 minute până poți folosi telefonul.**
-* a large `MM:SS` countdown inside a circular progress ring,
-* a red **Apel de urgență 112** button.
+* a large `MM:SS` countdown inside a circular progress ring.
+
+There is no other control on that screen, and no call control anywhere in the
+guard. The only way out of a break is the parent's seven-tap entry on the title
+(see [Parent access](#parent-access)), where `Resetează ciclul` ends it, or the
+break running out.
 
 Usage time only counts while the screen is on, the device is unlocked, the tweak
 is enabled and there is no parent pause. Break time counts in real time, even
@@ -39,7 +43,7 @@ SpringBoard restarts.
   * pause the cycle for 15/30/60 minutes (overlay hidden, timeline frozen and
     resumed exactly where it paused),
   * start a break immediately,
-  * reset the cycle,
+  * end the current break and start a fresh usage interval (`Resetează ciclul`),
   * change the PIN.
 
 There is **no factory, universal or recovery PIN**. On first run (no PIN
@@ -230,7 +234,8 @@ home screen, which runs the same wizard over its own pane — see
 pane is shown. The overlay's seven-tap parent panel is *not* a setup path — the
 overlay only appears once a break is running or through `Testează ecranul de
 blocare`, and neither can happen before setup. The wizard asks for the PIN
-twice, then the usage and break durations, explains the emergency valve, and
+twice, then the usage and break durations, shows the emergency recovery
+procedure (create the kill-switch file over SSH, delete it and respring), and
 finishes by storing the PIN, both durations, `SetupComplete = YES` and
 `enabled = 1`. The usage clock is re-anchored at that moment, so no time is
 billed for the period before setup finished. Until then the only key the tweak
@@ -295,7 +300,7 @@ respring is expected until the new runtime writes its first snapshot.
 ### Local trace (Settings pane)
 
 The pane cannot be observed without SSH: Preferences.app is a separate process
-and its crash reports are not reachable from a desktop sync tool. The 1.0.6
+and its crash reports are not reachable from a desktop sync tool. The 1.0.7
 bundle therefore keeps its own trace at
 
 ```
@@ -367,21 +372,39 @@ start, extend, shorten or end a break — the countdown it draws is the preview'
 own and goes away with it. It is refused while the parent panel is on screen or
 while the tweak is inert, and if a real break falls due during the preview the
 real overlay takes over. It also needs the runtime to be loaded: with a stale
-status file the button has nothing to talk to.
+status file the button has nothing to talk to. The preview draws the same title,
+subtitle and countdown and adds its own `Închide` button where the real break
+screen has no control at all; that button only ends the preview.
 
-## Safety valve
+## Calls and recovery
 
-The break overlay always exposes **Apel de urgență 112**. Pressing it hides the
-timeline and opens `tel:112` through SpringBoard, so a real emergency call can
-be placed even though every other interaction is blocked. The window stays open
-only while a call is active and closes as soon as the call ends; if no call ever
-starts it closes after 15 seconds. The overlay then returns by itself while the
-break is still running. Only the window steps aside: the home-button/Siri
-suppression stays armed for the whole emergency window, so the valve cannot be
-used to get free SpringBoard access. If the URL cannot be opened, the
-overlay reports `Apelul de urgență nu este disponibil pe acest dispozitiv.` in
-its subtitle instead of behind it. Blocking power, volume, lock or telephony is
-never attempted.
+Usage Guard contains **no call control anywhere**. The break overlay has no
+button and no `tel:` URL, the parent panel has no dial action, and neither the
+Settings pane nor the configuration app can place a call. This is a deliberate
+change: the previous release put a red **Apel de urgență 112** button on the
+block screen, and a child tapping it by mistake was indistinguishable from a
+real emergency.
+
+The trade-off, stated plainly: a child alone with the device during a break
+**cannot place an emergency call from the block screen, by design**. That is the
+price of not arming a one-tap emergency button where a child can reach it.
+
+A parent can still clear the way. The PIN-gated parent panel's
+**Resetează ciclul** ends the break and restarts a fresh usage interval, so the
+overlay goes away and the normal Phone app is available with no guard machinery
+in the way. That is the intended path for an adult who needs the phone,
+including to call an emergency number.
+
+Calls still win over the overlay in the other direction. While a call is active
+— incoming or outgoing — the overlay is suppressed, detected through the public
+read-only `CTCallCenter.currentCalls` API when the platform reports it, and the
+timeline returns by itself when the call ends while the break is still running.
+No telephony service is hooked, replaced or disabled. Blocking power, volume,
+lock or telephony is never attempted.
+
+If the guard makes the device unusable, the [kill switch](#emergency-recovery)
+takes effect within a second and `dpkg -r org.usageguard.timer` removes the
+package; neither path needs the PIN.
 
 Apple's own passcode and lock screen are untouched. If the device locks, the
 native lock screen takes over, the overlay hides, and it reappears after unlock
@@ -435,7 +458,7 @@ uploads:
 
 | artifact | contents |
 | --- | --- |
-| `usage-guard-deb` | `org.usageguard.timer_1.0.6_iphoneos-arm.deb` — install this |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.7_iphoneos-arm.deb` — install this |
 | `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
 | `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
 
@@ -450,7 +473,7 @@ Validation is enforced, not advisory: before building, the pipeline fails unless
 `control`, the preference bundle's `Info.plist` (`prefs/Resources/Info.plist`,
 the file Theos stages into the bundle), the app's `Info.plist`
 (`app/Resources/Info.plist`) and `src/UGVersion.h` all carry the same version,
-and unless the pane takes that version from the header — a hard-coded `1.0.6`
+and unless the pane takes that version from the header — a hard-coded `1.0.7`
 literal in `prefs/UGPreferencesListController.m`,
 `prefs/UGPreferencesController.m` or `prefs/UGSettingsIPC.m` fails the build.
 The same step also fails if
@@ -502,7 +525,7 @@ make package FINALPACKAGE=1
 ```
 
 The package is written to `packages/` as
-`org.usageguard.timer_1.0.6_iphoneos-arm.deb`. The tweak targets
+`org.usageguard.timer_1.0.7_iphoneos-arm.deb`. The tweak targets
 `iphone:clang:6.1:6.0`, `ARCHS = armv7` (iPhone 4S / iPad 2 class hardware).
 
 ### Host tests (no Theos, no device)
@@ -528,9 +551,9 @@ Copy the built `.deb` to the device and install it with dpkg, then respring or
 restart SpringBoard:
 
 ```sh
-scp packages/org.usageguard.timer_1.0.6_iphoneos-arm.deb root@DEVICE_IP:/var/root/
+scp packages/org.usageguard.timer_1.0.7_iphoneos-arm.deb root@DEVICE_IP:/var/root/
 ssh root@DEVICE_IP \
-  'dpkg -i /var/root/org.usageguard.timer_1.0.6_iphoneos-arm.deb && killall -9 SpringBoard'
+  'dpkg -i /var/root/org.usageguard.timer_1.0.7_iphoneos-arm.deb && killall -9 SpringBoard'
 ```
 
 A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'
@@ -644,13 +667,15 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   with root access, who can unload the tweak or call private APIs directly.
 * **Not a passcode replacement.** The tweak never touches Apple's lock state
   or passcode; a locked device shows the native lock screen.
-* **Emergency valve window.** While `tel:112` is opened the timeline stays
-  hidden for as long as the call lasts; if no call ever starts, it comes back
-  after 15 seconds. If SpringBoard silently refuses to open the URL, the timeline
-  still returns after that window. If the dialer itself is unreachable, the
-  button reports that emergency calling is unavailable inside the overlay.
-* **Calls always win.** While a call is active (incoming, outgoing or the
-  emergency call itself) the overlay is suppressed, detected through the public
+* **No call control at all.** The overlay, the parent panel and both settings
+  hosts have no dialler, no `tel:` URL and no emergency button, so a child
+  cannot call 112 from the block screen. A parent with the PIN can end the break
+  with `Resetează ciclul` and then use the Phone app normally. The trade-off is
+  deliberate and stated in [Calls and recovery](#calls-and-recovery): a child
+  who needs help during a break has to wait for the break to end or find an
+  adult with the PIN.
+* **Calls always win.** While a call is active (incoming or outgoing) the
+  overlay is suppressed, detected through the public
   read-only `CTCallCenter.currentCalls` API when the platform reports it. No telephony service is hooked,
   replaced or disabled; the overlay simply stays out of the way until the call
   ends.
@@ -727,6 +752,6 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   Settings pane, the configuration app, the status file, the Darwin
   notifications or the overlay on hardware. Runtime behaviour must be
   smoke-tested on a real jailbroken iOS 6.1.3 device: respring, the home-screen
-  icon after `uicache`, overlay over several apps, lock/unlock, the emergency
-  call, PIN lockout, a Settings round-trip, the same round-trip from the app and
-  the test overlay.
+  icon after `uicache`, overlay over several apps, lock/unlock, that the block
+  screen and the parent panel offer no call control, PIN lockout, a Settings
+  round-trip, the same round-trip from the app and the test overlay.

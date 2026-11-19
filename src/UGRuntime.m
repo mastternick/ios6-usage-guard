@@ -19,9 +19,6 @@ static NSString *const kUGNotificationScreenBlanked = @"com.apple.springboard.ha
 static NSString *const kUGNotificationLockComplete = @"com.apple.springboard.lockcomplete";
 static NSString *const kUGNotificationLockState = @"com.apple.springboard.lockstate";
 
-/* Escape window while the dialer opens and no call ever starts. */
-static const long long kUGEmergencyNoCallSeconds = 15;
-
 /* At most one state write per minute unless something actually happened. */
 static const long long kUGPersistIntervalSeconds = 60;
 
@@ -320,8 +317,6 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     BOOL _unlocked;
     BOOL _callActive;
 
-    long long _emergencyUntil;
-    BOOL _emergencyCallSeen;
     long long _lastPersistWall;
     NSString *_savedStateString;
     CTCallCenter *_callCenter;
@@ -437,8 +432,6 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     if (!_inert) {
         _inert = YES;
         sUGOverlayLocked = 0;
-        _emergencyUntil = 0;
-        _emergencyCallSeen = NO;
         /* A preview left running would keep the overlay window visible while
          * the tweak is supposed to be doing nothing at all. */
         [self endTestOverlay];
@@ -479,7 +472,6 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
      * overlay hidden — or on the lock screen — for the rest of a break. */
     [self refreshDeviceState];
     [self refreshCallActive];
-    [self updateEmergencyState];
     [self rebaseClockIfBecameActive:(wasScreenOn && wasUnlocked)];
 
     now = UGNowSeconds();
@@ -570,35 +562,9 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     _callActive = _callCenter.currentCalls.count > 0;
 }
 
-/*
- * Closes the emergency escape window as soon as the call ends, or after
- * kUGEmergencyNoCallSeconds when no call ever started: dialling 112 and hanging
- * up must not keep the overlay away.
- */
-- (void)updateEmergencyState
-{
-    long long now;
-
-    if (_emergencyUntil <= 0) return;
-
-    now = UGNowSeconds();
-    if (_callActive) {
-        /* A real call keeps the overlay away for its whole length; the window
-         * closes as soon as the call ends. */
-        _emergencyCallSeen = YES;
-        return;
-    }
-
-    if (_emergencyCallSeen || now >= _emergencyUntil) {
-        _emergencyUntil = 0;
-        _emergencyCallSeen = NO;
-    }
-}
-
 - (void)syncUI
 {
     long long now;
-    BOOL emergency;
     BOOL locked;
 
     /* A refresh queued before the kill switch must not lock the home button
@@ -618,8 +584,8 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         } else if (_panelPresented) {
             /* The panel needs the window; the preview must not fight it. */
             [self endTestOverlay];
-        } else if (!(ug_is_locked(&_state, now) && _screenOn && _unlocked &&
-                     _emergencyUntil <= now && !_callActive)) {
+        } else if (!(ug_is_locked(&_state, now) &&
+                     _screenOn && _unlocked && !_callActive)) {
             /* Preview in progress: it owns the window and deliberately leaves
              * sUGOverlayLocked alone, so Home and Siri keep working. */
             [self ensureWindow];
@@ -644,16 +610,12 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         return;
     }
 
-    emergency = _emergencyUntil > now;
-    locked = ug_is_locked(&_state, now) && _screenOn && _unlocked &&
-             !emergency && !_callActive;
+    locked = ug_is_locked(&_state, now) &&
+             _screenOn && _unlocked && !_callActive;
 
-    /* The window hides for the emergency valve and for any call, but the
-     * bypass hooks stay armed for as long as the valve window is open —
-     * including the whole duration of an emergency call, not just the 15 s
-     * deadline. Hiding the overlay must not hand out free SpringBoard access.
-     * A plain call that was not started from the overlay arms nothing. */
-    sUGOverlayLocked = (locked || _emergencyUntil > 0) ? 1 : 0;
+    /* A call hides the overlay, but the bypass hooks stay armed: hiding the
+     * overlay must not hand out free SpringBoard access. */
+    sUGOverlayLocked = locked ? 1 : 0;
 
     if (!_window) return;
 
@@ -964,39 +926,6 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     (void)controller;
     /* Nothing to undo: the preview never armed the guard or moved the state. */
     [self endTestOverlay];
-}
-
-- (void)overlayControllerDidRequestEmergencyCall:(UGOverlayController *)controller
-{
-    NSURL *emergencyURL;
-
-    (void)controller;
-
-    /* Safety valve: the timeline steps aside for a short window so a real call
-     * can be dialled. The window closes when the call ends (or after 15 s when
-     * no call starts), so tapping and hanging up is not a way to stay out. */
-    _emergencyUntil = UGNowSeconds() + kUGEmergencyNoCallSeconds;
-    _emergencyCallSeen = NO;
-    /* The window hides so the dialer is reachable, but the bypass hooks stay
-     * armed: only the overlay goes away, not the guard. syncUI keeps them
-     * armed for the whole emergency window. */
-    sUGOverlayLocked = 1;
-    [_window setHidden:YES];
-
-    emergencyURL = [NSURL URLWithString:@"tel:112"];
-    if (![[UIApplication sharedApplication] canOpenURL:emergencyURL]) {
-        _emergencyUntil = 0;
-        /* The alert window sits below the overlay window, so the message has to
-         * live inside the overlay itself to be readable. */
-        [self ensureWindow];
-        [_window.overlayController
-            showNotice:@"Apelul de urgență nu este disponibil pe acest dispozitiv."];
-        [self syncUI];
-        return;
-    }
-
-    [[UIApplication sharedApplication] openURL:emergencyURL];
-    [self persistIfChanged:YES];
 }
 
 #pragma mark - Device state

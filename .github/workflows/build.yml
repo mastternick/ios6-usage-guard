@@ -70,7 +70,7 @@ jobs:
       - name: Verify version consistency
         run: |
           set -euo pipefail
-          want="1.0.6"
+          want="1.0.7"
           fail=0
 
           report() {  # $1 file, $2 extracted value, $3 label
@@ -558,6 +558,17 @@ jobs:
               "- package id: `org.usageguard.timer`",
               "- architecture: armv7 only; deployment target iOS 6.0; rootful layout",
               "- built and statically validated by CI: %s" % run_url,
+              "- Usage Guard contains **no call control anywhere**: the break",
+              "  overlay has no button and no `tel:` URL, and the parent panel has no",
+              "  dial action. By design a child cannot place an emergency call from",
+              "  the block screen; an incoming or active call still hides the overlay",
+              "  until it ends",
+              "- a parent with the PIN can end a break from the parent panel",
+              "  (`Resetează ciclul`) and then use the Phone app normally",
+              "- recovery without the PIN is unchanged: the kill switch",
+              "  (`touch /var/mobile/Library/Preferences/org.usageguard.timer.disable`)",
+              "  makes the tweak inert within a second, and",
+              "  `dpkg -r org.usageguard.timer` removes it",
               "- configuration app: `org.usageguard.timer.app` in",
               "  `/Applications/UsageGuard.app` — a **jailbreak app, not a sandboxed App Store",
               "  IPA** — is the configuration UI while the tweak enforces; the Settings pane",

@@ -19,9 +19,7 @@ static const NSInteger kUGParentTapCount = 7;
     CAShapeLayer *_ringTrack;
     CAShapeLayer *_ringProgress;
     UILabel *_countdownLabel;
-    UIButton *_emergencyButton;
     UIButton *_dismissButton;
-    NSString *_notice;
     long long _remaining;
     NSInteger _titleTapCount;
     NSTimeInterval _firstTitleTapTime;
@@ -130,23 +128,11 @@ static const NSInteger kUGParentTapCount = 7;
     _countdownLabel.text = @"00:00";
     [_ringContainer addSubview:_countdownLabel];
 
-    _emergencyButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    _emergencyButton.frame = CGRectMake(centerX - 120.0f, 386.0f, 240.0f, 50.0f);
-    _emergencyButton.backgroundColor = [UIColor colorWithRed:0.78f green:0.16f blue:0.16f alpha:1.0f];
-    _emergencyButton.layer.cornerRadius = 25.0f;
-    _emergencyButton.titleLabel.font = [UIFont boldSystemFontOfSize:17.0f];
-    [_emergencyButton setTitle:@"Apel de urgență 112" forState:UIControlStateNormal];
-    [_emergencyButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [_emergencyButton addTarget:self
-                         action:@selector(handleEmergencyTap:)
-               forControlEvents:UIControlEventTouchUpInside];
-    [_contentView addSubview:_emergencyButton];
-
-    /* Shares the emergency button's slot: the two are never visible together,
-     * so the 320x480 layout has no extra element to fit. 240x50 keeps the
-     * touch target above 44 pt. */
+    /* Only the Settings preview shows this button; the real break screen has no
+     * tappable control at all. 240x50 at y=386 leaves 44 pt below it inside the
+     * 480 pt screen and keeps the touch target above 44 pt. */
     _dismissButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    _dismissButton.frame = _emergencyButton.frame;
+    _dismissButton.frame = CGRectMake(centerX - 120.0f, 386.0f, 240.0f, 50.0f);
     _dismissButton.backgroundColor = accentColor;
     _dismissButton.layer.cornerRadius = 25.0f;
     _dismissButton.titleLabel.font = [UIFont boldSystemFontOfSize:17.0f];
@@ -198,11 +184,6 @@ static const NSInteger kUGParentTapCount = 7;
         return;
     }
 
-    if (_notice.length > 0) {
-        _subtitleLabel.text = _notice;
-        return;
-    }
-
     minutes = (_remaining + 59) / 60;
     if (minutes < 1) minutes = 1;
     _subtitleLabel.text = [NSString stringWithFormat:
@@ -215,25 +196,13 @@ static const NSInteger kUGParentTapCount = 7;
 
     _testMode = testMode;
     if (testMode) {
-        _notice = nil;
         _contentView.hidden = NO;
         _titleLabel.text = @"Mod de test";
-        /* A preview must not be able to dial 112: the emergency valve is
-         * replaced by the dismiss button for as long as the preview lasts. */
-        _emergencyButton.hidden = YES;
         _dismissButton.hidden = NO;
     } else {
         _titleLabel.text = @"Pauză de la telefon!";
-        _emergencyButton.hidden = NO;
         _dismissButton.hidden = YES;
     }
-    [self refreshSubtitle];
-}
-
-- (void)showNotice:(NSString *)notice
-{
-    if (![self isViewLoaded]) [self view];
-    _notice = [notice copy];
     [self refreshSubtitle];
 }
 
@@ -245,7 +214,6 @@ static const NSInteger kUGParentTapCount = 7;
 
     _contentView.hidden = !locked;
     if (!locked) {
-        _notice = nil;
         _remaining = 0;
         return;
     }
@@ -297,11 +265,6 @@ static const NSInteger kUGParentTapCount = 7;
         _titleTapCount = 0;
         [self.delegate overlayControllerDidRequestParentAccess:self];
     }
-}
-
-- (void)handleEmergencyTap:(id)sender
-{
-    [self.delegate overlayControllerDidRequestEmergencyCall:self];
 }
 
 - (void)handleDismissTap:(id)sender

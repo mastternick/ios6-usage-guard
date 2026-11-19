@@ -3,16 +3,17 @@
 @class UGOverlayController;
 
 @protocol UGOverlayControllerDelegate <NSObject>
-- (void)overlayControllerDidRequestEmergencyCall:(UGOverlayController *)controller;
 - (void)overlayControllerDidRequestParentAccess:(UGOverlayController *)controller;
 /* The test-mode dismiss button was tapped; the runtime ends the preview. */
 - (void)overlayControllerDidRequestTestDismiss:(UGOverlayController *)controller;
 @end
 
 /*
- * Full-screen break overlay: gradient background, circular progress ring,
- * exact Romanian child-facing copy and the emergency-call valve. Frames are
- * laid out for the 320x480 screen and centered horizontally.
+ * Full-screen break overlay: gradient background, circular progress ring and
+ * exact Romanian child-facing copy. There is deliberately no dialing control
+ * here: a child taps such a button by mistake. Placing a call lives behind the
+ * PIN-gated parent panel instead. Frames are laid out for the 320x480 screen
+ * and centered horizontally.
  */
 @interface UGOverlayController : UIViewController
 
@@ -24,13 +25,9 @@
            remaining:(long long)remaining
             duration:(long long)duration;
 
-/* Child-facing message shown in place of the minute count (for example when the
- * emergency call cannot be dialled). Cleared when the overlay hides. */
-- (void)showNotice:(NSString *)notice;
-
-/* Settings preview: shows the break screen with test copy and a dismiss button
- * instead of the emergency valve, so a preview can neither call 112 nor open
- * the parent gate. Toggling it off restores the real break copy. */
+/* Settings preview: shows the break screen with test copy and a dismiss button,
+ * so a preview can neither open the parent gate nor act on the guard. Toggling
+ * it off restores the real break copy. */
 - (void)setTestMode:(BOOL)testMode;
 
 @end
