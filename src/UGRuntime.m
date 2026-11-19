@@ -299,6 +299,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
 - (void)updateTestOverlayAt:(long long)now;
 - (void)endTestOverlay;
 - (void)writeStatusIfNeeded:(BOOL)forced;
+- (void)answerPing;
 @end
 
 @implementation UGRuntime {
@@ -379,6 +380,15 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
                                    userInfo:nil
                                     repeats:YES];
     [[NSRunLoop mainRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
+
+    /* Registered here, not with the activation observers, so an inert runtime
+     * still answers the pane's ping. Runs once: -start returns early above. */
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                    (__bridge const void *)self,
+                                    UGDarwinNotificationCallback,
+                                    (__bridge CFStringRef)kUGNotifyPing,
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
 }
 
 /* Installs hooks, notifications and the window. Idempotent. */
@@ -985,6 +995,11 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     BOOL wasScreenOn = _screenOn;
     BOOL wasUnlocked = _unlocked;
 
+    if ([name isEqualToString:kUGNotifyPing]) {
+        [self answerPing];
+        return;
+    }
+
     if ([name isEqualToString:kUGNotifySettingsChanged]) {
         if ([self enterInertModeIfNeeded]) return;
         [self handleSettingsChanged];
@@ -1005,6 +1020,18 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
         [self persistIfChanged:(_screenOn != wasScreenOn || _unlocked != wasUnlocked)];
     }
     [self syncUI];
+}
+
+/*
+ * Answers the pane's ping. The inert transition check runs first, exactly as in
+ * the tick, so a disabled runtime still answers. The forced write bypasses the
+ * 2 s throttle and the signature, so LastTick always moves on a ping.
+ */
+- (void)answerPing
+{
+    [self enterInertModeIfNeeded];
+    [self writeStatusIfNeeded:YES];
+    notify_post([kUGNotifyPong UTF8String]);
 }
 
 #pragma mark - Notifications and hooks

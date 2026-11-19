@@ -33,6 +33,20 @@
 /* YES when SpringBoard ticked within the freshness window and reported a pid. */
 - (BOOL)runtimeIsLive;
 
+/* Runtime diagnostics. pingRuntime makes SpringBoard force a status write and
+ * answer with a pong; the verdict and diagnostics strings combine that answer
+ * with the status file for display. */
+- (void)pingRuntime;
+- (NSString *)pingStateDescription;
+- (NSString *)runtimeVerdict;
+- (NSString *)diagnosticsDescription;
+- (long long)statusAgeSeconds;
+- (BOOL)dylibInstalled;
+- (BOOL)filterInstalled;
+
+/* Relaunches SpringBoard through /usr/bin/killall. NO when the helper could not be started. */
+- (BOOL)respring;
+
 /* PIN vault pass-throughs. setPIN: and verifyPIN: announce the write they cause
  * (the failure counter and lockout deadline live in the same file). */
 - (BOOL)hasPIN;

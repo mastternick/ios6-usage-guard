@@ -70,7 +70,7 @@ jobs:
       - name: Verify version consistency
         run: |
           set -euo pipefail
-          want="1.0.8"
+          want="1.0.9"
           fail=0
 
           report() {  # $1 file, $2 extracted value, $3 label
@@ -579,6 +579,13 @@ jobs:
               "  `/var/mobile/Library/Preferences/org.usageguard.timer.trace.log` while it",
               "  runs and on an uncaught exception, so a crashing Settings pane can be",
               "  diagnosed without SSH (export the file with 3uTools)",
+              "- robust start: the runtime starts from a MobileSubstrate constructor as",
+              "  well as the SpringBoard launch hook; a second start is a no-op, so a",
+              "  late injection cannot leave it dormant",
+              "- liveness probe: the Settings pane's `Rulează diagnostic` action posts",
+              "  `org.usageguard.timer.ping`; the runtime forces a status write and answers",
+              "  with `org.usageguard.timer.pong`. `Repornește SpringBoard` (alert-confirmed,",
+              "  not PIN-gated) is the one-tap recovery when the runtime stays silent",
               "",
               "### Install",
               "",

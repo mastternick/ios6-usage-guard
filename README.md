@@ -120,7 +120,7 @@ The pane has five sections, top to bottom:
 | **Time Limits** | `Utilizare (minute)` and `Pauză (minute)`, 1–240 each, edited through a prompt |
 | **Actions** | `Începe pauza acum`, `Resetează ciclul`, `Pauză 15 min`, `Pauză 30 min`, `Pauză 60 min`, `Reia restricțiile`, `Testează ecranul de blocare` |
 | **Security** | `Schimbă codul PIN` (`Setează un cod PIN` when none is stored) and the `Cere PIN pentru modificări` switch |
-| **Information** | tweak version, runtime, bundle version, preferences path, status-file age, `Jurnal` (trace path and size), `Șterge jurnalul` |
+| **Information** | tweak version, runtime, `Verdict runtime`, `Diagnostic` (dylib/filter presence), bundle version, preferences path, status-file age, `Jurnal` (trace path and size), `Șterge jurnalul`, `Rulează diagnostic`, `Repornește SpringBoard` |
 
 The pane does not carry separate kill-switch or `DebugLogging` rows: `Stare`
 reads `Disponibil` while the runtime reports inert or the kill-switch marker
@@ -274,7 +274,7 @@ KillSwitch  DebugLogging  Version (string)
 `Enabled` is the effective value (`SetupComplete` **and** the stored enabled
 flag), not the raw switch. `LastTick` is a wall-clock heartbeat: a status file
 whose `LastTick` is more than 5 seconds old, or a missing file, is the pane's
-"the dylib is not loaded" signal — SpringBoard either never injected the tweak
+"Runtime: nu este detectat" signal (see [Runtime diagnostics](#runtime-diagnostics)) — SpringBoard either never injected the tweak
 or has been restarted since. That freshness window is the only liveness
 evidence the pane has; it never assumes the tweak is running.
 
@@ -300,7 +300,7 @@ respring is expected until the new runtime writes its first snapshot.
 ### Local trace (Settings pane)
 
 The pane cannot be observed without SSH: Preferences.app is a separate process
-and its crash reports are not reachable from a desktop sync tool. The 1.0.8
+and its crash reports are not reachable from a desktop sync tool. The 1.0.9
 bundle therefore keeps its own trace at
 
 ```
@@ -362,6 +362,82 @@ both generations — `org.usageguard.timer.trace.log` and, when present,
 `org.usageguard.timer.trace.log.1` — after which the row reads
 `absent sau gol`.
 
+## Runtime diagnostics
+
+### How it starts
+
+The runtime starts from two places, and either one is enough on its own:
+
+* a MobileSubstrate constructor (`%ctor` in `Tweak.x`), which runs when the
+  dylib is loaded into SpringBoard, and
+* the SpringBoard `applicationDidFinishLaunching:` hook, which runs once
+  SpringBoard is up.
+
+Both call `-start` on `UGRuntime`, which is idempotent. A dylib that
+MobileSubstrate injects after SpringBoard's launch hook has already run therefore
+still starts, from the constructor, instead of staying dormant until the next
+respring.
+
+### What `Runtime: nu este detectat` means
+
+The Status and Information sections of the pane show `Runtime: nu este detectat`
+when no status heartbeat has been written within the last 5 seconds: SpringBoard
+did not write `/var/mobile/Library/Preferences/org.usageguard.timer.status.plist`,
+or the file carries no runtime PID. The pane has no other source of liveness, so
+this row means only that **the pane cannot see a live runtime**. It does not mean
+the guard is broken: while the runtime is alive the break overlay works, whatever
+the row says.
+
+### Diagnostic verdicts
+
+The pane and the configuration app show a `Verdict runtime` row (Information
+section) with one of these verdicts, verbatim:
+
+| verdict | when |
+| --- | --- |
+| `Runtime activ: a răspuns la ping.` | a pong arrived after the last `Rulează diagnostic` tap |
+| `Se verifică runtime-ul…` | a ping was sent less than 1.5 s ago and no pong has arrived yet |
+| `Runtime activ, dar nu a răspuns la ping.` | the status file is fresh and has a PID, but the ping timed out |
+| `Runtime nu răspunde: verifică dylib-ul și filtrul, apoi repornește SpringBoard.` | the ping timed out and the status file is missing or stale |
+| `Runtime activ: status proaspăt cu PID.` | no ping was sent; the status file is fresh and has a PID |
+| `Neverificat: runtime nedetectat. Rulează diagnosticul.` | no ping was sent and the status file is missing or stale |
+
+The `Diagnostic` row next to it shows separately whether `UsageGuard.dylib` and
+its filter `UsageGuard.plist` exist in `/Library/MobileSubstrate/DynamicLibraries/`.
+
+### Rulează diagnostic
+
+The `Rulează diagnostic` action (Information section) posts
+`org.usageguard.timer.ping`. A live runtime answers by forcing a status write at
+once, instead of waiting for the next change or the 2-second heartbeat, and then
+posts `org.usageguard.timer.pong`. The `Verdict runtime` row picks the answer up
+on the pane's next 1-second refresh.
+
+### Repornește SpringBoard
+
+The `Repornește SpringBoard` action (Information section) asks for confirmation
+(`Repornești SpringBoard?`) and then restarts SpringBoard. It is **not** PIN-gated: it is a recovery
+action that must work when the parent cannot reach the panel, the same recovery
+class as the [kill switch](#emergency-recovery). The new SpringBoard starts the
+runtime through the constructor and the hook, which clears a runtime that stopped
+writing. It does not change the cycle, the PIN or the settings; the cycle is
+restored from the preferences file as described in [Persistence](#persistence).
+
+### Troubleshooting ladder
+
+1. Tap **Rulează diagnostic** and look at `Verdict runtime`. If it reads
+   `Runtime activ: a răspuns la ping.`, the runtime had only gone quiet.
+2. If it reads `Runtime nu răspunde: …`, tap **Repornește SpringBoard**,
+   confirm, and run the diagnostic again once SpringBoard is back.
+3. If it still does not answer, look at the `Diagnostic` row. If either
+   `UsageGuard.dylib` or `UsageGuard.plist` is reported missing from
+   `/Library/MobileSubstrate/DynamicLibraries/`, reinstall the `.deb` with
+   `dpkg -i` and respring.
+
+`Runtime: nu este detectat` is a statement about visibility, not about the guard.
+The overlay keeps working whenever the runtime is alive, so do not disable the
+guard or reinstall it on the strength of that row alone.
+
 ## Test overlay
 
 `Testează ecranul de blocare` (Actions) posts
@@ -416,7 +492,7 @@ while a break is still active.
 Makefile                Theos build: the tweak, the preference bundle and the app
 control                 Debian package metadata
 UsageGuard.plist        MobileSubstrate filter (com.apple.springboard)
-Tweak.x                single SpringBoard bootstrap hook
+Tweak.x                SpringBoard bootstrap: MobileSubstrate constructor and launch hook, both start UGRuntime
 layout/Library/PreferenceLoader/Preferences/UsageGuard.plist
                         PreferenceLoader entry (the Settings row)
 layout/DEBIAN/postinst  maintainer script: runs uicache so the home-screen entry appears
@@ -458,7 +534,7 @@ uploads:
 
 | artifact | contents |
 | --- | --- |
-| `usage-guard-deb` | `org.usageguard.timer_1.0.8_iphoneos-arm.deb` — install this |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.9_iphoneos-arm.deb` — install this |
 | `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
 | `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
 
@@ -473,7 +549,7 @@ Validation is enforced, not advisory: before building, the pipeline fails unless
 `control`, the preference bundle's `Info.plist` (`prefs/Resources/Info.plist`,
 the file Theos stages into the bundle), the app's `Info.plist`
 (`app/Resources/Info.plist`) and `src/UGVersion.h` all carry the same version,
-and unless the pane takes that version from the header — a hard-coded `1.0.8`
+and unless the pane takes that version from the header — a hard-coded `1.0.9`
 literal in `prefs/UGPreferencesListController.m`,
 `prefs/UGPreferencesController.m` or `prefs/UGSettingsIPC.m` fails the build.
 The same step also fails if
@@ -525,7 +601,7 @@ make package FINALPACKAGE=1
 ```
 
 The package is written to `packages/` as
-`org.usageguard.timer_1.0.8_iphoneos-arm.deb`. The tweak targets
+`org.usageguard.timer_1.0.9_iphoneos-arm.deb`. The tweak targets
 `iphone:clang:6.1:6.0`, `ARCHS = armv7` (iPhone 4S / iPad 2 class hardware).
 
 ### Host tests (no Theos, no device)
@@ -551,9 +627,9 @@ Copy the built `.deb` to the device and install it with dpkg, then respring or
 restart SpringBoard:
 
 ```sh
-scp packages/org.usageguard.timer_1.0.8_iphoneos-arm.deb root@DEVICE_IP:/var/root/
+scp packages/org.usageguard.timer_1.0.9_iphoneos-arm.deb root@DEVICE_IP:/var/root/
 ssh root@DEVICE_IP \
-  'dpkg -i /var/root/org.usageguard.timer_1.0.8_iphoneos-arm.deb && killall -9 SpringBoard'
+  'dpkg -i /var/root/org.usageguard.timer_1.0.9_iphoneos-arm.deb && killall -9 SpringBoard'
 ```
 
 A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'
@@ -638,7 +714,7 @@ respring, or boot into Safe Mode (MobileSubstrate disables tweaks there).
   `detail` class, and the bundle's `Info.plist` needs `NSPrincipalClass` — CI
   fails the build when any of them is missing. If the row is there but the
   Status section reports no live runtime, SpringBoard has not injected the tweak
-  or was restarted since — see Diagnostics above.
+  or was restarted since — see [Runtime diagnostics](#runtime-diagnostics).
 * **No Usage Guard entry on the home screen.** The app is installed by the
   package, but iOS 6 only registers a new `/Applications` bundle after
   `uicache` (run by the package's `postinst`); if it still does not appear,

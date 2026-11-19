@@ -55,10 +55,14 @@ enum {
     kUGInformationRowPreferencesPath = 3,
     kUGInformationRowTraceLog = 4,
     kUGInformationRowStatusAge = 5,
-    kUGInformationRowKillSwitch = 6,
-    kUGInformationRowDebugLogging = 7,
-    kUGInformationRowClearTraceLog = 8,
-    kUGInformationRowCount = 9
+    kUGInformationRowVerdict = 6,
+    kUGInformationRowDiagnostic = 7,
+    kUGInformationRowKillSwitch = 8,
+    kUGInformationRowDebugLogging = 9,
+    kUGInformationRowClearTraceLog = 10,
+    kUGInformationRowRunDiagnostic = 11,
+    kUGInformationRowRespring = 12,
+    kUGInformationRowCount = 13
 };
 
 /* Switch tags survive cell reuse; the action stays attached to the switch. */
@@ -74,6 +78,7 @@ enum {
     kUGAlertTagNewPIN = 104,
     kUGAlertTagConfirmPIN = 105,
     kUGAlertTagNotice = 106,
+    kUGAlertTagRespring = 107,
     kUGAlertTagWizardWelcome = 111,
     kUGAlertTagWizardPIN = 112,
     kUGAlertTagWizardConfirmPIN = 113,
@@ -554,7 +559,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     NSNumber *debug = [_status objectForKey:@"DebugLogging"];
 
     return [NSString stringWithFormat:
-            @"%d|%d|%lld|%lld|%d|%d|%ld|%ld|%d|%d|%d|%ld|%ld|%ld|%ld|%d|%lld",
+            @"%d|%d|%lld|%lld|%d|%d|%ld|%ld|%d|%d|%d|%ld|%ld|%ld|%ld|%d|%lld|%@",
             _state.enabled, _state.phase, _state.remaining, _state.overrideUntil,
             _state.usageMinutes, _state.breakMinutes,
             (long)(pid ? [pid longLongValue] : -1),
@@ -564,7 +569,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
             (debug ? [debug boolValue] : 0),
             (long)[_ipc hasPIN], (long)[_ipc requirePIN],
             (long)[_ipc setupComplete], (long)[_ipc lockoutRemaining],
-            [_ipc runtimeIsLive] ? 1 : 0, [self statusAgeSeconds]];
+            [_ipc runtimeIsLive] ? 1 : 0, [self statusAgeSeconds],
+            [_ipc runtimeVerdict]];
 }
 
 #pragma mark - State descriptions
@@ -744,6 +750,33 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     [_tableView reloadData];
 }
 
+- (void)runDiagnostic
+{
+    UGTrace(@"runDiagnostic: ping");
+    [_ipc pingRuntime];
+}
+
+- (void)presentRespringConfirm
+{
+    UGTrace(@"presentRespringConfirm");
+    /* No PIN: this only restarts SpringBoard, it changes no settings. */
+    UIAlertView *alert = [[UIAlertView alloc]
+                          initWithTitle:@"Repornești SpringBoard?"
+                                message:@"Ecranul se închide și reapare în câteva secunde. "
+                                         "Aplicațiile deschise se opresc."
+                               delegate:self
+                      cancelButtonTitle:@"Anulează"
+                      otherButtonTitles:@"Repornește", nil];
+    alert.tag = kUGAlertTagRespring;
+    [self presentAlert:alert];
+}
+
+- (void)respringDevice
+{
+    UGTrace(@"respringDevice: spawning killall");
+    if (![_ipc respring]) UGTrace(@"respringDevice: spawn failed");
+}
+
 #pragma mark - Table structure
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
@@ -783,7 +816,9 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     (void)tableView;
     if (indexPath.section == kUGSectionInformation &&
         (indexPath.row == kUGInformationRowPreferencesPath ||
-         indexPath.row == kUGInformationRowTraceLog)) {
+                 indexPath.row == kUGInformationRowTraceLog ||
+                 indexPath.row == kUGInformationRowVerdict ||
+                 indexPath.row == kUGInformationRowDiagnostic)) {
         return kUGPathRowHeight;
     }
     return kUGStandardRowHeight;
@@ -1029,6 +1064,12 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
                 case kUGInformationRowStatusAge:
                     return [self valueCellWithTitle:@"Stare runtime"
                                              detail:[self statusAgeDescription]];
+                case kUGInformationRowVerdict:
+                    return [self pathCellWithTitle:@"Verdict runtime"
+                                            detail:[_ipc runtimeVerdict]];
+                case kUGInformationRowDiagnostic:
+                    return [self pathCellWithTitle:@"Diagnostic"
+                                            detail:[_ipc diagnosticsDescription]];
                 case kUGInformationRowKillSwitch:
                     return [self valueCellWithTitle:@"Kill switch"
                                              detail:[self killSwitchDescription]];
@@ -1037,6 +1078,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
                                              detail:[self debugLoggingDescription]];
                 case kUGInformationRowClearTraceLog:
                     return [self buttonCellWithTitle:@"Șterge jurnalul"];
+                case kUGInformationRowRunDiagnostic:
+                    return [self buttonCellWithTitle:@"Rulează diagnostic"];
+                case kUGInformationRowRespring:
+                    return [self buttonCellWithTitle:@"Repornește SpringBoard"];
                 default:
                     break;
             }
@@ -1080,6 +1125,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
         case kUGSectionInformation:
             if (indexPath.row == kUGInformationRowClearTraceLog) [self deleteTraceLog];
+            else if (indexPath.row == kUGInformationRowRunDiagnostic) [self runDiagnostic];
+            else if (indexPath.row == kUGInformationRowRespring) [self presentRespringConfirm];
             break;
 
         default:
@@ -1763,6 +1810,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 
         case kUGAlertTagAuthorization:
             [self handleAuthorizationAlert:alertView cancelled:cancelled];
+            break;
+
+        case kUGAlertTagRespring:
+            if (!cancelled) [self respringDevice];
             break;
 
         case kUGAlertTagEditUsage:

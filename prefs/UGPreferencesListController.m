@@ -26,6 +26,7 @@ enum {
     kUGAlertTagNewPIN = 104,
     kUGAlertTagConfirmPIN = 105,
     kUGAlertTagNotice = 106,
+    kUGAlertTagRespring = 107,
     kUGAlertTagWizardWelcome = 111,
     kUGAlertTagWizardPIN = 112,
     kUGAlertTagWizardConfirmPIN = 113,
@@ -362,7 +363,7 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     NSNumber *debug = [_status objectForKey:@"DebugLogging"];
 
     return [NSString stringWithFormat:
-            @"%d|%d|%lld|%lld|%d|%d|%ld|%ld|%d|%d|%d|%ld|%ld|%ld|%ld|%d|%lld",
+            @"%d|%d|%lld|%lld|%d|%d|%ld|%ld|%d|%d|%d|%ld|%ld|%ld|%ld|%d|%lld|%@",
             _state.enabled, _state.phase, _state.remaining, _state.overrideUntil,
             _state.usageMinutes, _state.breakMinutes,
             (long)(pid ? [pid longLongValue] : -1),
@@ -372,7 +373,8 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
             (debug ? [debug boolValue] : 0),
             (long)[[self ugIPC] hasPIN], (long)[[self ugIPC] requirePIN],
             (long)[[self ugIPC] setupComplete], (long)[[self ugIPC] lockoutRemaining],
-            [[self ugIPC] runtimeIsLive] ? 1 : 0, [self ugStatusAgeSeconds]];
+            [[self ugIPC] runtimeIsLive] ? 1 : 0, [self ugStatusAgeSeconds],
+            [[self ugIPC] runtimeVerdict]];
 }
 
 - (void)ugReloadAndDisplay
@@ -598,6 +600,12 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Runtime"
                                                              get:@selector(runtimeForSpecifier:)]
                                   as:@"info.runtime"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Verdict runtime"
+                                                             get:@selector(runtimeVerdictForSpecifier:)]
+                                  as:@"info.verdict"]];
+    [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Diagnostic"
+                                                             get:@selector(diagnosticsForSpecifier:)]
+                                  as:@"info.diagnostics"]];
     [rows addObject:[self ugIdentify:[self ugValueSpecifierNamed:@"Versiune pachet"
                                                              get:@selector(bundleVersionForSpecifier:)]
                                   as:@"info.bundleVersion"]];
@@ -613,6 +621,12 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Șterge jurnalul"
                                                            action:@selector(ugDeleteTraceLog)]
                                   as:@"info.clearTraceLog"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Rulează diagnostic"
+                                                           action:@selector(ugRunDiagnostic)]
+                                  as:@"info.runDiagnostic"]];
+    [rows addObject:[self ugIdentify:[self ugButtonSpecifierNamed:@"Repornește SpringBoard"
+                                                           action:@selector(ugConfirmRespring)]
+                                  as:@"info.respring"]];
 
     return rows;
 }
@@ -805,6 +819,18 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
     return [self runtimeDescription];
 }
 
+- (id)runtimeVerdictForSpecifier:(PSSpecifier *)specifier
+{
+    (void)specifier;
+    return [[self ugIPC] runtimeVerdict];
+}
+
+- (id)diagnosticsForSpecifier:(PSSpecifier *)specifier
+{
+    (void)specifier;
+    return [[self ugIPC] diagnosticsDescription];
+}
+
 - (id)bundleVersionForSpecifier:(PSSpecifier *)specifier
 {
     (void)specifier;
@@ -960,6 +986,33 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
      * comes from a get selector, so rebuild the rows instead of trusting a
      * cached cell label. */
     [self reloadSpecifiers];
+}
+
+- (void)ugRunDiagnostic
+{
+    UGTrace(@"list action: run diagnostic");
+    [[self ugIPC] pingRuntime];
+}
+
+- (void)ugConfirmRespring
+{
+    UGTrace(@"list action: respring confirm");
+    /* No PIN: this only restarts SpringBoard, it changes no settings. */
+    UIAlertView *alert = [[UIAlertView alloc]
+                          initWithTitle:@"Repornești SpringBoard?"
+                                message:@"Ecranul se închide și reapare în câteva secunde. "
+                                         "Aplicațiile deschise se opresc."
+                               delegate:self
+                      cancelButtonTitle:@"Anulează"
+                      otherButtonTitles:@"Repornește", nil];
+    alert.tag = kUGAlertTagRespring;
+    [self presentAlert:alert];
+}
+
+- (void)ugRespring
+{
+    UGTrace(@"list respring: spawning killall");
+    if (![[self ugIPC] respring]) UGTrace(@"list respring: spawn failed");
 }
 
 #pragma mark - Authorization
@@ -1528,6 +1581,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
             if (resume) resume();
             break;
         }
+
+        case kUGAlertTagRespring:
+            if (!cancelled) [self ugRespring];
+            break;
 
         case kUGAlertTagAuthorization:
             [self handleAuthorizationAlert:alertView cancelled:cancelled];
