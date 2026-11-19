@@ -379,7 +379,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 {
     [self ugReloadLiveState];
     [self ugRefreshSpecifierContent];
-    [self reload];
+    /* A real change (user action, state transition, view appearing) may alter
+     * values that live in cached cell labels, so let the host rebuild the
+     * specifier rows; the 1 Hz cadence keeps the cheap [self reload]. */
+    [self reloadSpecifiers];
 }
 
 /* Deferred refresh for the one case where the row has to contradict itself for
@@ -953,9 +956,10 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 {
     UGTrace(@"list action: delete trace log size=%llu", UGTraceFileSize());
     UGTraceRemoveLog();
-    /* Only the Jurnal row's value changes, and that comes from its get
-     * selector: a table reload is enough. */
-    [self reload];
+    /* The Jurnal row is now empty and the row set is unchanged, but the value
+     * comes from a get selector, so rebuild the rows instead of trusting a
+     * cached cell label. */
+    [self reloadSpecifiers];
 }
 
 #pragma mark - Authorization

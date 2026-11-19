@@ -8,7 +8,7 @@
 #ifndef UG_VERSION_H
 #define UG_VERSION_H
 
-#define UG_VERSION "1.0.5"
+#define UG_VERSION "1.0.6"
 
 /* Persisted cycle state, PIN vault and settings, written by the tweak/pane. */
 #define UG_PREFS_PATH "/var/mobile/Library/Preferences/org.usageguard.timelock.plist"

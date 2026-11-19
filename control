@@ -1,6 +1,6 @@
 Package: org.usageguard.timer
 Name: Usage Guard
-Version: 1.0.5
+Version: 1.0.6
 Architecture: iphoneos-arm
 Description: Screen-time guard for iOS 6 - timed usage, mandatory breaks and a parent PIN panel.
 Maintainer: Usage Guard <maintainers@usageguard.invalid>
