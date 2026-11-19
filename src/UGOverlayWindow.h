@@ -11,9 +11,9 @@
 /*
  * Full-screen break overlay: gradient background, circular progress ring and
  * exact Romanian child-facing copy. There is deliberately no dialing control
- * here: a child taps such a button by mistake. Placing a call lives behind the
- * PIN-gated parent panel instead. Frames are laid out for the 320x480 screen
- * and centered horizontally.
+ * anywhere in the guard — a child taps such a button by mistake — and a parent
+ * ends a break from the PIN-gated panel (`Resetează ciclul`). Frames are laid
+ * out for the 320x480 screen and centered horizontally.
  */
 @interface UGOverlayController : UIViewController
 

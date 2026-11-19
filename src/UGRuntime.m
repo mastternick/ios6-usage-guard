@@ -613,8 +613,8 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     locked = ug_is_locked(&_state, now) &&
              _screenOn && _unlocked && !_callActive;
 
-    /* A call hides the overlay, but the bypass hooks stay armed: hiding the
-     * overlay must not hand out free SpringBoard access. */
+    /* A call hides the overlay and disarms the Home/Siri hooks for its
+     * duration; they re-arm when the overlay returns. */
     sUGOverlayLocked = locked ? 1 : 0;
 
     if (!_window) return;
