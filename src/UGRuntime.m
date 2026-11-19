@@ -370,7 +370,7 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
     _screenOn = NO;
     _unlocked = NO;
 
-    if (![self enterInertModeIfNeeded]) [self activate];
+    if (![self enterInertModeIfNeeded]) [self activateWhenApplicationReady:0];
 
     /* The clock runs even while inert: it is what notices the operator
      * removing the disable marker, and it performs no accounting then. */
@@ -389,6 +389,27 @@ static void UGDarwinNotificationCallback(CFNotificationCenterRef center,
                                     (__bridge CFStringRef)kUGNotifyPing,
                                     NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
+}
+
+/*
+ * The MobileSubstrate constructor can fire before UIApplicationMain has built
+ * the application object. Activating then would create the overlay window on a
+ * half-built SpringBoard, which a boot-time crash could turn into a respring
+ * loop. Wait for UIApplication to exist, preferring the launch notification,
+ * and fall back to a bounded poll so a late injection can never leave the
+ * runtime dormant.
+ */
+- (void)activateWhenApplicationReady:(NSInteger)attempt
+{
+    if ([UIApplication sharedApplication] != nil || attempt >= 15) {
+        [self activate];
+        return;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        [self activateWhenApplicationReady:attempt + 1];
+    });
 }
 
 /* Installs hooks, notifications and the window. Idempotent. */

@@ -300,7 +300,7 @@ respring is expected until the new runtime writes its first snapshot.
 ### Local trace (Settings pane)
 
 The pane cannot be observed without SSH: Preferences.app is a separate process
-and its crash reports are not reachable from a desktop sync tool. The 1.0.9
+and its crash reports are not reachable from a desktop sync tool. The 1.0.10
 bundle therefore keeps its own trace at
 
 ```
@@ -377,6 +377,12 @@ Both call `-start` on `UGRuntime`, which is idempotent. A dylib that
 MobileSubstrate injects after SpringBoard's launch hook has already run therefore
 still starts, from the constructor, instead of staying dormant until the next
 respring.
+
+The constructor path waits until `UIApplication` exists before it activates the
+runtime (creating the overlay window, installing the hooks). It polls every
+200 ms for up to 3 s and then proceeds regardless, so neither an early
+injection nor a late one can leave the runtime dormant, and an early activation
+cannot build the overlay on a half-initialised SpringBoard.
 
 ### What `Runtime: nu este detectat` means
 
@@ -534,7 +540,7 @@ uploads:
 
 | artifact | contents |
 | --- | --- |
-| `usage-guard-deb` | `org.usageguard.timer_1.0.9_iphoneos-arm.deb` — install this |
+| `usage-guard-deb` | `org.usageguard.timer_1.0.10_iphoneos-arm.deb` — install this |
 | `usage-guard-probe-deb` | minimal SpringBoard smoke-test package |
 | `build-logs` | full `make` output for both builds (also uploaded when a build fails) |
 
@@ -549,7 +555,7 @@ Validation is enforced, not advisory: before building, the pipeline fails unless
 `control`, the preference bundle's `Info.plist` (`prefs/Resources/Info.plist`,
 the file Theos stages into the bundle), the app's `Info.plist`
 (`app/Resources/Info.plist`) and `src/UGVersion.h` all carry the same version,
-and unless the pane takes that version from the header — a hard-coded `1.0.9`
+and unless the pane takes that version from the header — a hard-coded `1.0.10`
 literal in `prefs/UGPreferencesListController.m`,
 `prefs/UGPreferencesController.m` or `prefs/UGSettingsIPC.m` fails the build.
 The same step also fails if
@@ -601,7 +607,7 @@ make package FINALPACKAGE=1
 ```
 
 The package is written to `packages/` as
-`org.usageguard.timer_1.0.9_iphoneos-arm.deb`. The tweak targets
+`org.usageguard.timer_1.0.10_iphoneos-arm.deb`. The tweak targets
 `iphone:clang:6.1:6.0`, `ARCHS = armv7` (iPhone 4S / iPad 2 class hardware).
 
 ### Host tests (no Theos, no device)
@@ -627,9 +633,9 @@ Copy the built `.deb` to the device and install it with dpkg, then respring or
 restart SpringBoard:
 
 ```sh
-scp packages/org.usageguard.timer_1.0.9_iphoneos-arm.deb root@DEVICE_IP:/var/root/
+scp packages/org.usageguard.timer_1.0.10_iphoneos-arm.deb root@DEVICE_IP:/var/root/
 ssh root@DEVICE_IP \
-  'dpkg -i /var/root/org.usageguard.timer_1.0.9_iphoneos-arm.deb && killall -9 SpringBoard'
+  'dpkg -i /var/root/org.usageguard.timer_1.0.10_iphoneos-arm.deb && killall -9 SpringBoard'
 ```
 
 A `.deb` import feature in desktop jailbreak utilities (for example 3uTools'

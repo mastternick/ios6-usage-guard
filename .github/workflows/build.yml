@@ -70,7 +70,7 @@ jobs:
       - name: Verify version consistency
         run: |
           set -euo pipefail
-          want="1.0.9"
+          want="1.0.10"
           fail=0
 
           report() {  # $1 file, $2 extracted value, $3 label
