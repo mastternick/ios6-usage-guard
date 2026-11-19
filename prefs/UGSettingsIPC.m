@@ -191,11 +191,15 @@ static NSNumber *UGNumberIn(NSDictionary *dictionary, NSString *key)
 {
     char *const argv[] = { "killall", "SpringBoard", NULL };
     pid_t pid = 0;
-    if (posix_spawn(&pid, "/usr/bin/killall", NULL, NULL, argv, environ) != 0) return NO;
-
     int status = 0;
-    waitpid(pid, &status, 0);
-    return YES;
+
+    if (posix_spawn(&pid, "/usr/bin/killall", NULL, NULL, argv, environ) != 0) return NO;
+    if (waitpid(pid, &status, 0) != pid) return NO;
+
+    /* The helper running is not the same as SpringBoard dying: report only a
+     * clean exit so the caller can tell the parent when the respring did not
+     * happen instead of leaving the tap looking like a no-op. */
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 #pragma mark - PIN

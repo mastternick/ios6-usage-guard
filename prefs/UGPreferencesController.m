@@ -774,7 +774,11 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (void)respringDevice
 {
     UGTrace(@"respringDevice: spawning killall");
-    if (![_ipc respring]) UGTrace(@"respringDevice: spawn failed");
+    if ([_ipc respring]) return;
+
+    UGTrace(@"respringDevice: killall failed");
+    [self showNotice:@"SpringBoard nu a putut fi repornit. Rulează din nou diagnosticul sau repornește dispozitivul."
+                title:@"Repornește SpringBoard"];
 }
 
 #pragma mark - Table structure

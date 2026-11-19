@@ -1012,7 +1012,11 @@ static BOOL UGParseMinutes(NSString *text, int *minutes)
 - (void)ugRespring
 {
     UGTrace(@"list respring: spawning killall");
-    if (![[self ugIPC] respring]) UGTrace(@"list respring: spawn failed");
+    if ([[self ugIPC] respring]) return;
+
+    UGTrace(@"list respring: killall failed");
+    [self showNotice:@"SpringBoard nu a putut fi repornit. Rulează din nou diagnosticul sau repornește dispozitivul."
+                title:@"Repornește SpringBoard"];
 }
 
 #pragma mark - Authorization
